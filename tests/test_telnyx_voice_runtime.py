@@ -164,6 +164,55 @@ def test_signature_required_without_public_key_is_invalid(monkeypatch):
     assert voice._validate_telnyx_signature(b"{}", {}) is False
 
 
+def test_signature_rejects_wrong_key(monkeypatch):
+    """Verify that a valid signature from a different key is rejected."""
+    pytest.importorskip("nacl")
+    import base64
+    import time as _time
+    from nacl.signing import SigningKey
+
+    signing_key = SigningKey.generate()
+    wrong_key = SigningKey.generate().verify_key
+    public_key_b64 = base64.b64encode(bytes(wrong_key)).decode()
+
+    body = b'{"test": true}'
+    timestamp = str(int(_time.time()))
+    signed = signing_key.sign(f"{timestamp}|".encode() + body)
+    signature_b64 = base64.b64encode(signed.signature).decode()
+
+    voice = make_adapter(monkeypatch)
+    voice._public_key = public_key_b64
+    voice._require_signature = True
+
+    result = voice._validate_telnyx_signature(body, {
+        "Telnyx-Signature-Ed25519": signature_b64,
+        "Telnyx-Timestamp": timestamp,
+    })
+    assert result is False, "wrong key must reject"
+
+
+@pytest.mark.asyncio
+async def test_handle_webhook_rejects_missing_event_type(monkeypatch):
+    """Payloads without event_type should be rejected (not processed)."""
+    voice = make_adapter(monkeypatch)
+    called = False
+
+    async def fake_handle(event):
+        nonlocal called
+        called = True
+
+    voice.handle_message = fake_handle
+    payload = {"data": {"payload": {"id": "x", "call_control_id": "cc-x"}}}
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0)
+
+    assert response.status == 200
+    assert called is False
+
+
 def test_signature_verification_with_base64_keypair(monkeypatch):
     pytest.importorskip("nacl")
     import base64
