@@ -37,6 +37,7 @@ Recommended production hardening:
 export TELNYX_PUBLIC_KEY="<Telnyx webhook signing public key>"
 export TELNYX_VOICE_REQUIRE_SIGNATURE=true
 export TELNYX_VOICE_ALLOWED_USERS="+15551230001,+15551230002"
+export TELNYX_VOICE_ALLOW_ALL_USERS=false
 ```
 
 Optional:

@@ -75,3 +75,7 @@ optional_env:
     description: "Default language for call speak actions (default: en-US)"
     prompt: "Language"
     password: false
+  - name: TELNYX_VOICE_SIGNATURE_TOLERANCE
+    description: "Webhook signature timestamp tolerance in seconds (default: 300; 0 disables freshness check)"
+    prompt: "Signature tolerance seconds"
+    password: false
