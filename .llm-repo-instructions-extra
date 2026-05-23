@@ -1,0 +1,11 @@
+[ai_agent_software_engineer]
+- Do not commit secrets or generated audio.
+- Keep `main` minimal/stable; implementation happens on Linear-linked feature branches.
+- Local tests must pass without Telnyx credentials; live tests must be skipped unless `TELNYX_VOICE_LIVE_TEST=1` is set.
+- README and SKILL.md must agree on provider IDs, environment variables, paths, and endpoints.
+- Follow the same plugin-first platform adapter pattern used by `telnyx-hermes-sms`.
+
+[ai_agent_code_reviewer]
+- Verify that adapter.py, plugin.yaml, README.md, SKILL.md, and pyproject.toml are internally consistent.
+- Check that no stale references to `plugins/transcription-providers` or `plugins/speech-providers` exist.
+- Ensure webhook signature verification has replay protection and timestamp tolerance.

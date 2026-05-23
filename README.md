@@ -3,13 +3,14 @@
 This repository contains the Telnyx Voice Call platform adapter for
 [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-It is a **plugin-first platform adapter**. Hermes receives Telnyx Call Control
-webhooks as platform messages, and Hermes replies are spoken back into the call
-with Telnyx Call Control `speak` actions.
+It is a **plugin-first platform adapter** that exposes Telnyx Call Control as a
+Hermes platform channel named `telnyx_voice_call`. Hermes receives Telnyx Call
+Control webhooks as platform messages, and Hermes replies are spoken back into
+the call with Telnyx Call Control `speak` actions.
 
 The adapter follows the existing Hermes platform-plugin pattern used by the
-Telnyx SMS adapter, while aligning Call Control request and webhook behavior
-with the finalized OpenClaw voice-call plugin.
+Telnyx SMS adapter (`telnyx-hermes-sms`), while aligning Call Control request
+and webhook behavior with the finalized OpenClaw voice-call plugin.
 
 ## What's inside
 
@@ -31,21 +32,19 @@ with the finalized OpenClaw voice-call plugin.
 - Answers inbound calls and optionally speaks a greeting
 - Sends Hermes replies into active calls via `speak`
 - Creates outbound calls for E.164 targets
-- Uses `client_state`, `webhook_url_method: POST`, `timeout_secs`, and
-  `command_id` fields consistent with the OpenClaw voice-call implementation
 - Handles `call.initiated`, `call.answered`, `call.transcription`,
   `call.dtmf.received`, and `call.hangup` events
 - Supports Telnyx Ed25519 webhook signature verification with replay protection
+- Env-driven enablement, cron/home-channel delivery, standalone sender support,
+  allowlist controls, PII-safe display, and voice-call-specific prompt hints
 
 ## Fresh clone setup
 
 Requirements:
 
-- Python 3.10+; Python 3.12 is recommended because local Hermes checkouts may
-  use modern typing syntax.
+- Python 3.10+
 - A local Hermes Agent checkout for tests that import `gateway.*` modules.
   Set `HERMES_AGENT_ROOT` if it is not at `~/.hermes/hermes-agent`.
-- `uv` is recommended for reproducible local test dependencies.
 
 ```bash
 git clone https://github.com/team-telnyx/telnyx-hermes-voice-call.git
@@ -57,7 +56,7 @@ uv run --extra test python -m pytest tests/test_telnyx_voice_static.py tests/tes
 Without `uv`, use any Python 3.10+ virtualenv:
 
 ```bash
-python3.12 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[test]"
 export HERMES_AGENT_ROOT="$HOME/.hermes/hermes-agent"
@@ -84,16 +83,12 @@ Expected plugin tree:
   adapter.py
 ```
 
-Enable the plugin in Hermes. Depending on the Hermes CLI version, use the
-plugin manifest name/key shown by `hermes plugins list`; for this plugin that is
-usually `telnyx-voice-call-platform` or the directory key `telnyx_voice_call`:
+Then enable the plugin and configure credentials:
 
 ```bash
 hermes plugins list
 hermes plugins enable telnyx-voice-call-platform  # or: hermes plugins enable telnyx_voice_call
 ```
-
-Then configure credentials and enable the platform:
 
 ```bash
 # Append Telnyx vars to your existing Hermes .env (do NOT overwrite):
@@ -123,16 +118,11 @@ plugins/platforms/telnyx_voice_call/
   adapter.py
 ```
 
-No core Hermes code changes are required. Hermes' platform registry handles:
-
-- adapter creation via `ctx.register_platform(...)`
-- dynamic `Platform("telnyx_voice_call")` enum support
-- env-driven enablement
-- allowed-user / allow-all auth checks
-- cron/home-channel delivery
-- standalone out-of-process sends
-- `hermes status` / setup UI display
-- platform prompt hints
+Hermes' platform registry handles adapter creation via
+`ctx.register_platform(...)`, dynamic `Platform("telnyx_voice_call")` enum
+support, env-driven enablement, allowed-user / allow-all auth checks,
+cron/home-channel delivery, standalone out-of-process sends, and platform
+prompt hints.
 
 ## Required Telnyx setup
 
@@ -228,15 +218,18 @@ keys are supported. PEM and DER SPKI keys are also supported when the optional
 
 ```bash
 # No credentials needed
-python -m pytest tests/test_telnyx_voice_static.py tests/test_telnyx_voice_runtime.py tests/test_telnyx_voice_plugin_loading.py -q
+uv run --extra test python -m pytest tests/test_telnyx_voice_static.py tests/test_telnyx_voice_runtime.py tests/test_telnyx_voice_plugin_loading.py -q
+```
 
-# Live test (requires Telnyx credentials and makes a real outbound call)
+Live outbound call test requires an explicit safety flag and makes a real call:
+
+```bash
 export TELNYX_VOICE_LIVE_TEST=1
 export TELNYX_API_KEY=***
 export TELNYX_VOICE_FROM_NUMBER=+15550000001
 export TELNYX_CALL_CONTROL_CONNECTION_ID=1234567890
 export TELNYX_VOICE_LIVE_TO_NUMBER=+15550000002
-python -m pytest tests/test_telnyx_voice_live.py -q
+uv run --extra test python -m pytest tests/test_telnyx_voice_live.py -q -m live
 ```
 
 ## References
@@ -244,3 +237,4 @@ python -m pytest tests/test_telnyx_voice_live.py -q
 - [Telnyx Call Control API](https://developers.telnyx.com/docs/api/v2/call-control)
 - [Telnyx webhook signing](https://developers.telnyx.com/docs/v2/development/webhooks/receiving-webhooks)
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+- [Telnyx SMS adapter for Hermes](https://github.com/team-telnyx/telnyx-hermes-sms) (sister platform adapter)

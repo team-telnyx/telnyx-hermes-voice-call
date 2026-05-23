@@ -1,1 +1,1 @@
-include README.md LICENSE SKILL.md plugin.yaml .env.example
+include LICENSE README.md SKILL.md plugin.yaml .env.example

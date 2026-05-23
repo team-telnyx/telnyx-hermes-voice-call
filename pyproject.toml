@@ -1,16 +1,22 @@
 [project]
 name = "telnyx-hermes-voice-call"
 version = "0.1.0"
-description = "Telnyx Voice Call platform adapter for Hermes Agent"
+description = "Telnyx Voice Call platform adapter contribution for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Telnyx AI FDE" }]
-dependencies = ["aiohttp>=3.9"]
+dependencies = [
+  "aiohttp>=3.9",
+]
 
 [project.optional-dependencies]
 signature = ["PyNaCl>=1.5", "cryptography>=42"]
-test = ["pytest>=8", "pytest-asyncio>=0.23", "aiohttp>=3.9", "PyNaCl>=1.5", "cryptography>=42"]
+test = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "PyYAML>=6",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -23,3 +29,7 @@ include-package-data = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+  "live: requires live Telnyx credentials and makes a real outbound call",
+]

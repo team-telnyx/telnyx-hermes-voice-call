@@ -8,6 +8,7 @@ import adapter
 from gateway.config import PlatformConfig
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_live_outbound_call_smoke(monkeypatch):
     """Optional live call test, never runs unless explicitly enabled.
