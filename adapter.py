@@ -202,6 +202,7 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         except ValueError:
             self._signature_tolerance = 300
         self._active_calls: dict[str, CallSession] = {}
+        self._pending_speak: dict[str, str] = {}  # call_control_id → queued text
         self._replay_cache: dict[str, float] = {}
         self._runner = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
@@ -295,6 +296,13 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
 
         if target.startswith(CALL_CONTROL_PREFIX):
             call_control_id = _strip_call_control_prefix(target)
+            # If the call hasn't been answered yet, queue the speak instead
+            # of sending it into a dead call (Telnyx returns 422).
+            session = self._active_calls.get(call_control_id)
+            if session and session.state not in ("answered", "active"):
+                logger.info("[telnyx_voice_call] call not answered yet; queuing speak for %s", call_control_id)
+                self._pending_speak[call_control_id] = text
+                return SendResult(success=True, message_id=call_control_id)
             return await self._speak(call_control_id, text)
 
         if E164_RE.match(target):
@@ -332,12 +340,12 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 state="initiated",
                 started_at=time.time(),
             )
-            # Telnyx may reject speak until the call is answered.  Try once so
-            # short cron/notification calls work when the API accepts queued
-            # speak, but still report call creation success if it is too early.
+            # Try speak immediately; if Telnyx rejects it (call not yet
+            # answered), queue the text for delivery on call.answered.
             speak_result = await self._speak(call_control_id, text)
             if not speak_result.success:
-                logger.info("[telnyx_voice_call] outbound call created; speak will require answered webhook: %s", speak_result.error)
+                logger.info("[telnyx_voice_call] outbound call created; queuing speak for call.answered: %s", speak_result.error)
+                self._pending_speak[call_control_id] = text
             return SendResult(success=True, message_id=call_control_id, raw_response=response)
         return SendResult(success=True, raw_response=response)
 
@@ -422,6 +430,11 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             await self._emit_call_event(payload, session, call_control_id, "Incoming Telnyx voice call")
         elif event_type == "call.answered":
             session.state = "answered"
+            # Drain any queued speak from before the call was answered.
+            queued_text = self._pending_speak.pop(call_control_id, None)
+            if queued_text:
+                logger.info("[telnyx_voice_call] delivering queued speak for %s", call_control_id)
+                await self._speak(call_control_id, queued_text)
             # Surface answered events so the agent can decide what to say next.
             await self._emit_call_event(payload, session, call_control_id, "Telnyx voice call answered")
         elif event_type == "call.transcription":
@@ -434,6 +447,7 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 await self._emit_call_event(payload, session, call_control_id, f"Caller pressed {digit}")
         elif event_type == "call.hangup":
             session.state = "ended"
+            self._pending_speak.pop(call_control_id, None)
             await self._emit_call_event(payload, session, call_control_id, "Call ended")
             self._active_calls.pop(call_control_id, None)
             logger.info("[telnyx_voice_call] call ended for %s", call_control_id)

@@ -234,3 +234,128 @@ def test_signature_verification_with_base64_keypair(monkeypatch):
         "Telnyx-Signature-Ed25519": signature_b64,
         "Telnyx-Timestamp": timestamp,
     }) is True
+
+
+@pytest.mark.asyncio
+async def test_outbound_call_queues_speak_on_422(monkeypatch):
+    """When Telnyx rejects immediate speak (422), text is queued for call.answered."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    # Override FakeSession to return 422 on speak (call not answered yet)
+    class SpeakRejectSession(FakeSession):
+        def post(self, url, json=None, headers=None):
+            self.posts.append({"url": url, "json": json, "headers": headers})
+            if url.endswith("/calls"):
+                return FakeResponse(body={"data": {"call_control_id": "cc-out-422"}})
+            if "/actions/speak" in url:
+                return FakeResponse(status=422, body={"errors": [{"code": 90008, "title": "Call is not in progress"}]})
+            return FakeResponse()
+
+    voice._http_session = SpeakRejectSession()
+    result = await voice.send("+15550000002", "Hello queued")
+    assert result.success is True
+    assert result.message_id == "cc-out-422"
+    # Text should be queued, not lost
+    assert voice._pending_speak.get("cc-out-422") == "Hello queued"
+
+
+@pytest.mark.asyncio
+async def test_call_answered_drains_queued_speak(monkeypatch):
+    """Queued speak is delivered when call.answered webhook arrives."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._greeting = None
+
+    # Simulate a call with queued speak
+    voice._active_calls["cc-ans-1"] = adapter.CallSession(
+        call_control_id="cc-ans-1",
+        call_session_id="sess-1",
+        client_state="cs-1",
+        caller_number="+15550000001",
+        dialed_number="+15550000002",
+        direction="outbound",
+        state="initiated",
+        started_at=0,
+    )
+    voice._pending_speak["cc-ans-1"] = "Queued message"
+
+    captured = []
+    async def fake_handle(event):
+        captured.append(event)
+    voice.handle_message = fake_handle
+
+    payload = {
+        "data": {
+            "event_type": "call.answered",
+            "payload": {
+                "id": "evt-ans-1",
+                "call_control_id": "cc-ans-1",
+                "direction": "outgoing",
+                "from": "+15550000001",
+                "to": "+15550000002",
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0)
+
+    assert response.status == 200
+    # Queued speak should have been delivered
+    assert "cc-ans-1" not in voice._pending_speak
+    # First post is the speak, second is the answered event
+    speak_posts = [p for p in fake.posts if "/actions/speak" in p["url"]]
+    assert len(speak_posts) == 1
+    assert speak_posts[0]["json"]["payload"] == "Queued message"
+
+
+@pytest.mark.asyncio
+async def test_hangup_cleans_up_pending_speak(monkeypatch):
+    """Pending speak is removed when call hangs up without being answered."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    voice._active_calls["cc-hup-1"] = adapter.CallSession(
+        call_control_id="cc-hup-1",
+        call_session_id="sess-hup",
+        client_state="cs-hup",
+        caller_number="+15550000001",
+        dialed_number="+15550000002",
+        direction="outbound",
+        state="initiated",
+        started_at=0,
+    )
+    voice._pending_speak["cc-hup-1"] = "Will never be spoken"
+
+    captured = []
+    async def fake_handle(event):
+        captured.append(event)
+    voice.handle_message = fake_handle
+
+    payload = {
+        "data": {
+            "event_type": "call.hangup",
+            "payload": {
+                "id": "evt-hup-1",
+                "call_control_id": "cc-hup-1",
+                "direction": "outgoing",
+                "from": "+15550000001",
+                "to": "+15550000002",
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0)
+
+    assert response.status == 200
+    assert "cc-hup-1" not in voice._pending_speak
+    assert "cc-hup-1" not in voice._active_calls
