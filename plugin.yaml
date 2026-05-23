@@ -1,7 +1,7 @@
 name: telnyx-voice-call-platform
 label: Telnyx Voice Call
 kind: platform
-version: 1.0.0
+version: 0.1.0
 description: >
   Telnyx Voice Call gateway adapter for Hermes Agent. Runs an aiohttp webhook
   server for Telnyx Call Control events, answers inbound calls, and uses Call

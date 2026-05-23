@@ -197,6 +197,10 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         self._voice = _env("TELNYX_VOICE_DEFAULT_VOICE") or str(extra.get("voice", DEFAULT_VOICE))
         self._language = _env("TELNYX_VOICE_LANGUAGE") or str(extra.get("language", DEFAULT_LANGUAGE))
         self._greeting = _env("TELNYX_VOICE_GREETING") or str(extra.get("greeting", "")).strip()
+        try:
+            self._signature_tolerance = int(_env("TELNYX_VOICE_SIGNATURE_TOLERANCE") or str(extra.get("signature_tolerance", "300")))
+        except ValueError:
+            self._signature_tolerance = 300
         self._active_calls: dict[str, CallSession] = {}
         self._replay_cache: dict[str, float] = {}
         self._runner = None
@@ -430,6 +434,7 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 await self._emit_call_event(payload, session, call_control_id, f"Caller pressed {digit}")
         elif event_type == "call.hangup":
             session.state = "ended"
+            await self._emit_call_event(payload, session, call_control_id, "Call ended")
             self._active_calls.pop(call_control_id, None)
             logger.info("[telnyx_voice_call] call ended for %s", call_control_id)
         elif event_type in {"call.bridged", "call.recording.saved", "call.speak.started", "call.speak.ended"}:
@@ -560,8 +565,8 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             return False
 
         try:
-            tolerance = int(_env("TELNYX_VOICE_SIGNATURE_TOLERANCE", "300"))
-        except ValueError:
+            tolerance = self._signature_tolerance
+        except AttributeError:
             tolerance = 300
         if tolerance > 0:
             try:
