@@ -16,7 +16,7 @@ Use Telnyx Call Control as a first-class Hermes platform adapter for voice calls
 mkdir -p ~/.hermes/plugins/telnyx_voice_call
 cp __init__.py adapter.py plugin.yaml ~/.hermes/plugins/telnyx_voice_call/
 hermes plugins list
-hermes plugins enable telnyx-voice-call-platform  # or telnyx_voice_call depending on CLI key
+hermes plugins enable telnyx-voice-call-platform
 ```
 
 Restart the Hermes gateway after enabling the plugin.

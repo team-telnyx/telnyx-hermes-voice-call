@@ -87,7 +87,7 @@ Then enable the plugin and configure credentials:
 
 ```bash
 hermes plugins list
-hermes plugins enable telnyx-voice-call-platform  # or: hermes plugins enable telnyx_voice_call
+hermes plugins enable telnyx-voice-call-platform
 ```
 
 ```bash
@@ -98,10 +98,9 @@ cat .env.example >> ~/.hermes/.env
 
 ```yaml
 # ~/.hermes/config.yaml
-gateway:
-  platforms:
-    telnyx_voice_call:
-      enabled: true
+platforms:
+  telnyx_voice_call:
+    enabled: true
 ```
 
 Restart the Hermes gateway after installing/enabling the plugin so the platform

@@ -23,8 +23,10 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["adapter"]
-include-package-data = true
+py-modules = ["adapter", "__init__"]
+
+[tool.setuptools.data-files]
+"." = ["plugin.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
