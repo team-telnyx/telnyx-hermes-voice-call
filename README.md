@@ -18,6 +18,7 @@ and webhook behavior with the finalized OpenClaw voice-call plugin.
 |------|---------|
 | `__init__.py` | Hermes directory-plugin entry point that exposes `register(ctx)` |
 | `adapter.py` | Hermes platform adapter implementation |
+| `provisioning.py` | Auto-provisioning: creates CC app + orders phone number |
 | `plugin.yaml` | Platform plugin metadata and setup env var definitions |
 | `.env.example` | Copyable environment variable template |
 | `tests/test_telnyx_voice_static.py` | Manifest/static/API shape checks |
@@ -33,8 +34,12 @@ and webhook behavior with the finalized OpenClaw voice-call plugin.
 - Sends Hermes replies into active calls via `speak`
 - Creates outbound calls for E.164 targets
 - Handles `call.initiated`, `call.answered`, `call.transcription`,
-  `call.dtmf.received`, and `call.hangup` events
+  `call.dtmf.received`, `call.conference.created`, `call.recording.started`,
+  `call.transferred`, and `call.hangup` events
 - Supports Telnyx Ed25519 webhook signature verification with replay protection
+- **Call control actions:** hangup, conference, recording (start/stop), transfer
+- **Auto-provisioning:** optionally creates a Call Control app + orders a phone
+  number when the adapter connects, so the agent becomes a phone number on enable
 - Env-driven enablement, cron/home-channel delivery, standalone sender support,
   allowlist controls, PII-safe display, and voice-call-specific prompt hints
 
@@ -71,7 +76,7 @@ Copy this repository's plugin files into a Hermes plugin directory:
 
 ```bash
 mkdir -p ~/.hermes/plugins/telnyx_voice_call
-cp __init__.py adapter.py plugin.yaml ~/.hermes/plugins/telnyx_voice_call/
+cp __init__.py adapter.py provisioning.py plugin.yaml ~/.hermes/plugins/telnyx_voice_call/
 ```
 
 Expected plugin tree:
@@ -81,6 +86,7 @@ Expected plugin tree:
   plugin.yaml
   __init__.py
   adapter.py
+  provisioning.py
 ```
 
 Then enable the plugin and configure credentials:
@@ -115,6 +121,7 @@ plugins/platforms/telnyx_voice_call/
   plugin.yaml
   __init__.py
   adapter.py
+  provisioning.py
 ```
 
 Hermes' platform registry handles adapter creation via
@@ -123,13 +130,50 @@ support, env-driven enablement, allowed-user / allow-all auth checks,
 cron/home-channel delivery, standalone out-of-process sends, and platform
 prompt hints.
 
-## Required Telnyx setup
+## Auto-provisioning
 
-1. Create or choose a Telnyx Call Control application.
+Set `TELNYX_VOICE_AUTO_PROVISION=true` and provide only `TELNYX_API_KEY`. On
+connect, the adapter will:
+
+1. Create a Telnyx Call Control application with the configured webhook URL.
+2. Search for an available US voice phone number.
+3. Order the number and assign it to the Call Control application.
+4. Persist the provisioned state to `provisioned.json` (idempotent on restart).
+5. Use the provisioned `connection_id` and `from_number` automatically.
+
+On disconnect, auto-provisioned resources are cleaned up (number order and CC
+application deleted).
+
+If `TELNYX_VOICE_FROM_NUMBER` and `TELNYX_CALL_CONTROL_CONNECTION_ID` are
+already set, auto-provisioning is skipped regardless of the flag — the adapter
+uses the manually configured values.
+
+## Required Telnyx setup (manual mode)
+
+When auto-provisioning is not enabled, you need to set up Telnyx resources
+manually:
+
+1. Create or choose a Telnyx Call Control application at
+   [Mission Control → Call Control](https://portal.telnyx.com/#/app/call-control/applications).
 2. Point its webhook URL at this adapter's public webhook URL, for example:
    `https://example.ngrok.app/webhooks/telnyx/voice`.
 3. Assign a Telnyx number to the Call Control application for inbound calls.
 4. Configure the required env vars below.
+
+## Call control actions
+
+The adapter exposes call control methods that can be invoked programmatically:
+
+| Method | Telnyx API | Description |
+|--------|-----------|-------------|
+| `hangup(call_control_id)` | `POST /calls/{id}/actions/hangup` | Hang up an active call |
+| `create_conference(call_control_id, name)` | `POST /calls/{id}/actions/conference` | Add a call leg to a conference bridge |
+| `start_recording(call_control_id)` | `POST /calls/{id}/actions/record_start` | Start recording a call |
+| `stop_recording(call_control_id)` | `POST /calls/{id}/actions/record_stop` | Stop recording a call |
+| `transfer_call(call_control_id, to)` | `POST /calls/{id}/actions/transfer` | Transfer a call to another destination |
+
+All methods return `SendResult` with `success=True/False` and error details on
+failure.
 
 ## Environment variables
 
@@ -137,20 +181,26 @@ prompt hints.
 
 | Variable | Description |
 |----------|-------------|
-| `TELNYX_API_KEY` | Telnyx API key used for Call Control API requests |
+| `TELNYX_API_KEY` | Telnyx API key used for Call Control API requests. Create one at [Mission Control → API Keys](https://portal.telnyx.com/#/app/api-keys). |
+
+### Required unless auto-provisioning is enabled
+
+| Variable | Description |
+|----------|-------------|
 | `TELNYX_VOICE_FROM_NUMBER` | Telnyx-owned E.164 caller ID used for outbound calls |
-| `TELNYX_CALL_CONTROL_CONNECTION_ID` | Telnyx Call Control application connection ID |
+| `TELNYX_CALL_CONTROL_CONNECTION_ID` | Telnyx Call Control application connection ID. Find it at [Mission Control → Call Control](https://portal.telnyx.com/#/app/call-control/applications). |
 
 ### Optional
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `TELNYX_VOICE_AUTO_PROVISION` | `false` | Auto-provision CC app + phone number on enable |
 | `TELNYX_VOICE_WEBHOOK_URL` | unset | Public webhook URL sent when creating outbound calls |
 | `TELNYX_VOICE_API_BASE` | `https://api.telnyx.com/v2` | Telnyx API base URL override |
 | `TELNYX_VOICE_WEBHOOK_HOST` | `127.0.0.1` | Webhook bind host |
 | `TELNYX_VOICE_WEBHOOK_PORT` | `8088` | Webhook listen port |
 | `TELNYX_VOICE_WEBHOOK_PATH` | `/webhooks/telnyx/voice` | Webhook path |
-| `TELNYX_PUBLIC_KEY` | unset | Telnyx account public key for webhook signature verification |
+| `TELNYX_PUBLIC_KEY` | unset | Telnyx account public key for webhook signature verification. Find it at [Mission Control → Public Key](https://portal.telnyx.com/#/app/account/public-key). |
 | `TELNYX_VOICE_REQUIRE_SIGNATURE` | `false` | Require valid Telnyx webhook signatures |
 | `TELNYX_VOICE_SIGNATURE_TOLERANCE` | `300` | Signature timestamp tolerance in seconds; `0` disables freshness check |
 | `TELNYX_VOICE_ALLOWED_USERS` | unset | Comma-separated E.164 numbers allowed to call the bot |
@@ -234,6 +284,7 @@ uv run --extra test python -m pytest tests/test_telnyx_voice_live.py -q -m live
 ## References
 
 - [Telnyx Call Control API](https://developers.telnyx.com/docs/api/v2/call-control)
+- [Telnyx Call Control Commands](https://developers.telnyx.com/docs/api/v2/call-control/Call-Commands)
 - [Telnyx webhook signing](https://developers.telnyx.com/docs/v2/development/webhooks/receiving-webhooks)
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 - [Telnyx SMS adapter for Hermes](https://github.com/team-telnyx/telnyx-hermes-sms) (sister platform adapter)

@@ -27,6 +27,8 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import redact_phone, strip_markdown
 from gateway.session import SessionSource
 
+from provisioning import ProvisioningResult, deprovision, provision
+
 logger = logging.getLogger(__name__)
 
 TELNYX_API_BASE = "https://api.telnyx.com/v2"
@@ -41,6 +43,7 @@ E164_RE = re.compile(r"^\+[1-9]\d{1,14}$")
 CALL_CONTROL_PREFIX = "call_control:"
 REPLAY_WINDOW_SECONDS = 10 * 60
 REPLAY_CACHE_MAX_ENTRIES = 10_000
+DEFAULT_AUTO_PROVISION = False
 
 
 @dataclass
@@ -129,6 +132,10 @@ def check_requirements() -> bool:
         import aiohttp  # noqa: F401
     except ImportError:
         return False
+    # API key is always required; connection_id + from_number are optional
+    # when auto-provision is enabled.
+    if _truthy(_env("TELNYX_VOICE_AUTO_PROVISION")):
+        return bool(_env("TELNYX_API_KEY"))
     return bool(
         _env("TELNYX_API_KEY")
         and _env("TELNYX_VOICE_FROM_NUMBER")
@@ -139,6 +146,11 @@ def check_requirements() -> bool:
 def validate_config(config: PlatformConfig) -> bool:
     extra = getattr(config, "extra", {}) or {}
     api_key = _env("TELNYX_API_KEY") or str(extra.get("api_key", "")).strip()
+    if not api_key:
+        return False
+    # When auto-provision is enabled, connection_id and from_number can be omitted.
+    if _truthy(_env("TELNYX_VOICE_AUTO_PROVISION")) or _truthy(str(extra.get("auto_provision", ""))):
+        return True
     from_number = _env("TELNYX_VOICE_FROM_NUMBER") or str(extra.get("from_number", "")).strip()
     connection_id = _env("TELNYX_CALL_CONTROL_CONNECTION_ID") or str(extra.get("connection_id", "")).strip()
     return bool(api_key and from_number and connection_id)
@@ -150,9 +162,14 @@ def is_connected(config: PlatformConfig) -> bool:
 
 def _env_enablement() -> dict | None:
     api_key = _env("TELNYX_API_KEY")
+    if not api_key:
+        return None
+
+    # With auto-provision, connection_id and from_number are optional.
     from_number = _env("TELNYX_VOICE_FROM_NUMBER")
     connection_id = _env("TELNYX_CALL_CONTROL_CONNECTION_ID")
-    if not (api_key and from_number and connection_id):
+    auto_provision = _truthy(_env("TELNYX_VOICE_AUTO_PROVISION"))
+    if not (from_number and connection_id) and not auto_provision:
         return None
 
     seed: dict[str, Any] = {
@@ -162,6 +179,8 @@ def _env_enablement() -> dict | None:
         "webhook_port": _env("TELNYX_VOICE_WEBHOOK_PORT", str(DEFAULT_WEBHOOK_PORT)),
         "webhook_path": _env("TELNYX_VOICE_WEBHOOK_PATH", DEFAULT_WEBHOOK_PATH),
     }
+    if auto_provision:
+        seed["auto_provision"] = True
     webhook_url = _env("TELNYX_VOICE_WEBHOOK_URL")
     if webhook_url:
         seed["webhook_url"] = webhook_url
@@ -201,9 +220,11 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             self._signature_tolerance = int(_env("TELNYX_VOICE_SIGNATURE_TOLERANCE") or str(extra.get("signature_tolerance", "300")))
         except ValueError:
             self._signature_tolerance = 300
+        self._auto_provision = _truthy(_env("TELNYX_VOICE_AUTO_PROVISION") or str(extra.get("auto_provision", ""))) or DEFAULT_AUTO_PROVISION
         self._active_calls: dict[str, CallSession] = {}
         self._pending_speak: dict[str, str] = {}  # call_control_id → queued text
         self._replay_cache: dict[str, float] = {}
+        self._provisioned: Optional[ProvisioningResult] = None
         self._runner = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
 
@@ -216,6 +237,32 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             logger.error(msg)
             self._set_fatal_error("telnyx_voice_missing_api_key", msg, retryable=False)
             return False
+
+        # Auto-provision: if enabled and connection_id/from_number are missing,
+        # create a Call Control app + order a number automatically.
+        if self._auto_provision and (not self._connection_id or not self._from_number):
+            try:
+                webhook_url = self._webhook_url or f"http://{self._webhook_host}:{self._webhook_port}{self._webhook_path}"
+                result = await provision(
+                    self._api_key,
+                    webhook_url,
+                    connection_id=self._connection_id,
+                    from_number=self._from_number,
+                )
+                self._connection_id = result.connection_id
+                self._from_number = result.from_number
+                self._provisioned = result
+                logger.info(
+                    "[telnyx_voice_call] auto-provisioned: from=%s, connection_id=%s",
+                    redact_phone(self._from_number),
+                    self._connection_id,
+                )
+            except Exception as exc:
+                msg = f"[telnyx_voice_call] auto-provisioning failed: {exc}"
+                logger.error(msg)
+                self._set_fatal_error("telnyx_voice_provision_failed", msg, retryable=True)
+                return False
+
         if not self._from_number:
             msg = "[telnyx_voice_call] TELNYX_VOICE_FROM_NUMBER not set"
             logger.error(msg)
@@ -266,6 +313,12 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        # Deprovision auto-created resources on graceful shutdown.
+        if self._provisioned and self._api_key:
+            try:
+                await deprovision(self._api_key)
+            except Exception as exc:
+                logger.warning("[telnyx_voice_call] deprovision failed: %s", exc)
         self._mark_disconnected()
         logger.info("[telnyx_voice_call] disconnected")
 
@@ -365,6 +418,66 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
         return SendResult(success=True, message_id=call_control_id, raw_response=response)
 
+    # ------------------------------------------------------------------
+    # Call Control actions
+    # ------------------------------------------------------------------
+
+    async def hangup(self, call_control_id: str) -> SendResult:
+        """Hang up an active call."""
+        response = await self._post_json(
+            f"/calls/{call_control_id}/actions/hangup",
+            {"command_id": f"hermes-hangup-{uuid.uuid4()}"},
+        )
+        if response.get("error"):
+            return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
+        return SendResult(success=True, message_id=call_control_id, raw_response=response)
+
+    async def create_conference(self, call_control_id: str, conference_name: str) -> SendResult:
+        """Add a call leg to a conference bridge."""
+        payload = {
+            "command_id": f"hermes-conf-{uuid.uuid4()}",
+            "name": conference_name,
+            "beep_enabled": "never",
+            "start_conference_on_create": True,
+        }
+        response = await self._post_json(f"/calls/{call_control_id}/actions/conference", payload)
+        if response.get("error"):
+            return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
+        return SendResult(success=True, message_id=call_control_id, raw_response=response)
+
+    async def start_recording(self, call_control_id: str, *, format: str = "mp3", channels: str = "single") -> SendResult:
+        """Start recording a call."""
+        payload = {
+            "command_id": f"hermes-rec-start-{uuid.uuid4()}",
+            "format": format,
+            "channels": channels,
+        }
+        response = await self._post_json(f"/calls/{call_control_id}/actions/record_start", payload)
+        if response.get("error"):
+            return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
+        return SendResult(success=True, message_id=call_control_id, raw_response=response)
+
+    async def stop_recording(self, call_control_id: str) -> SendResult:
+        """Stop recording a call."""
+        payload = {
+            "command_id": f"hermes-rec-stop-{uuid.uuid4()}",
+        }
+        response = await self._post_json(f"/calls/{call_control_id}/actions/record_stop", payload)
+        if response.get("error"):
+            return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
+        return SendResult(success=True, message_id=call_control_id, raw_response=response)
+
+    async def transfer_call(self, call_control_id: str, to: str) -> SendResult:
+        """Transfer a call to another destination."""
+        payload = {
+            "command_id": f"hermes-transfer-{uuid.uuid4()}",
+            "to": to,
+        }
+        response = await self._post_json(f"/calls/{call_control_id}/actions/transfer", payload)
+        if response.get("error"):
+            return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
+        return SendResult(success=True, message_id=call_control_id, raw_response=response)
+
     async def _answer(self, call_control_id: str) -> SendResult:
         response = await self._post_json(
             f"/calls/{call_control_id}/actions/answer",
@@ -451,6 +564,12 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             await self._emit_call_event(payload, session, call_control_id, "Call ended")
             self._active_calls.pop(call_control_id, None)
             logger.info("[telnyx_voice_call] call ended for %s", call_control_id)
+        elif event_type == "call.conference.created":
+            logger.info("[telnyx_voice_call] conference created for %s", call_control_id)
+        elif event_type == "call.recording.started":
+            logger.info("[telnyx_voice_call] recording started for %s", call_control_id)
+        elif event_type == "call.transferred":
+            logger.info("[telnyx_voice_call] call transferred for %s", call_control_id)
         elif event_type in {"call.bridged", "call.recording.saved", "call.speak.started", "call.speak.ended"}:
             logger.info("[telnyx_voice_call] received lifecycle event %s for %s", event_type, call_control_id)
         else:

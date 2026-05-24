@@ -75,6 +75,10 @@ optional_env:
     description: "Default language for call speak actions (default: en-US)"
     prompt: "Language"
     password: false
+  - name: TELNYX_VOICE_AUTO_PROVISION
+    description: "Auto-provision Call Control app + phone number on enable (default: false)"
+    prompt: "Enable auto-provisioning? (true/false)"
+    password: false
   - name: TELNYX_VOICE_SIGNATURE_TOLERANCE
     description: "Webhook signature timestamp tolerance in seconds (default: 300; 0 disables freshness check)"
     prompt: "Signature tolerance seconds"

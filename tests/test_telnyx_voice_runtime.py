@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
@@ -9,6 +10,13 @@ from aiohttp.test_utils import make_mocked_request
 from gateway.config import PlatformConfig
 
 import adapter
+from provisioning import (
+    ProvisioningResult,
+    ProvisionedState,
+    delete_provisioned_state,
+    load_provisioned_state,
+    save_provisioned_state,
+)
 
 
 class FakeResponse:
@@ -59,6 +67,30 @@ def test_validate_config_accepts_env_without_extra(monkeypatch):
     assert adapter.validate_config(PlatformConfig(enabled=True, extra={})) is True
 
 
+def test_validate_config_auto_provision_allows_missing_connection(monkeypatch):
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_AUTO_PROVISION", "true")
+    monkeypatch.delenv("TELNYX_VOICE_FROM_NUMBER", raising=False)
+    monkeypatch.delenv("TELNYX_CALL_CONTROL_CONNECTION_ID", raising=False)
+    assert adapter.validate_config(PlatformConfig(enabled=True, extra={})) is True
+
+
+def test_check_requirements_auto_provision_needs_only_api_key(monkeypatch):
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_AUTO_PROVISION", "true")
+    monkeypatch.delenv("TELNYX_VOICE_FROM_NUMBER", raising=False)
+    monkeypatch.delenv("TELNYX_CALL_CONTROL_CONNECTION_ID", raising=False)
+    assert adapter.check_requirements() is True
+
+
+def test_check_requirements_without_auto_provision_needs_all(monkeypatch):
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.delenv("TELNYX_VOICE_FROM_NUMBER", raising=False)
+    monkeypatch.delenv("TELNYX_CALL_CONTROL_CONNECTION_ID", raising=False)
+    monkeypatch.delenv("TELNYX_VOICE_AUTO_PROVISION", raising=False)
+    assert adapter.check_requirements() is False
+
+
 def test_env_enablement(monkeypatch):
     monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
     monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
@@ -69,6 +101,16 @@ def test_env_enablement(monkeypatch):
     assert seed["connection_id"] == "conn-123"
     assert seed["webhook_port"] == "8088"
     assert seed["home_channel"]["chat_id"] == "+15550000002"
+
+
+def test_env_enablement_auto_provision(monkeypatch):
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_AUTO_PROVISION", "true")
+    monkeypatch.delenv("TELNYX_VOICE_FROM_NUMBER", raising=False)
+    monkeypatch.delenv("TELNYX_CALL_CONTROL_CONNECTION_ID", raising=False)
+    seed = adapter._env_enablement()
+    assert seed is not None
+    assert seed.get("auto_provision") is True
 
 
 @pytest.mark.asyncio
@@ -115,6 +157,87 @@ async def test_send_rejects_invalid_target(monkeypatch):
     result = await voice.send("not-a-number", "hello")
     assert result.success is False
     assert "Expected E.164" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Call control actions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hangup_posts_hangup_action(monkeypatch):
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    result = await voice.hangup("cc-123")
+
+    assert result.success is True
+    assert len(fake.posts) == 1
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-123/actions/hangup"
+    assert fake.posts[0]["json"]["command_id"].startswith("hermes-hangup-")
+
+
+@pytest.mark.asyncio
+async def test_create_conference_posts_conference_action(monkeypatch):
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    result = await voice.create_conference("cc-123", "my-room")
+
+    assert result.success is True
+    assert len(fake.posts) == 1
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-123/actions/conference"
+    assert fake.posts[0]["json"]["name"] == "my-room"
+    assert fake.posts[0]["json"]["start_conference_on_create"] is True
+
+
+@pytest.mark.asyncio
+async def test_start_recording_posts_record_start_action(monkeypatch):
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    result = await voice.start_recording("cc-123")
+
+    assert result.success is True
+    assert len(fake.posts) == 1
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-123/actions/record_start"
+    assert fake.posts[0]["json"]["format"] == "mp3"
+    assert fake.posts[0]["json"]["channels"] == "single"
+
+
+@pytest.mark.asyncio
+async def test_stop_recording_posts_record_stop_action(monkeypatch):
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    result = await voice.stop_recording("cc-123")
+
+    assert result.success is True
+    assert len(fake.posts) == 1
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-123/actions/record_stop"
+
+
+@pytest.mark.asyncio
+async def test_transfer_call_posts_transfer_action(monkeypatch):
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    result = await voice.transfer_call("cc-123", "+15550000099")
+
+    assert result.success is True
+    assert len(fake.posts) == 1
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-123/actions/transfer"
+    assert fake.posts[0]["json"]["to"] == "+15550000099"
+
+
+# ---------------------------------------------------------------------------
+# Webhook handling
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -359,3 +482,180 @@ async def test_hangup_cleans_up_pending_speak(monkeypatch):
     assert response.status == 200
     assert "cc-hup-1" not in voice._pending_speak
     assert "cc-hup-1" not in voice._active_calls
+
+
+@pytest.mark.asyncio
+async def test_conference_created_webhook_is_logged(monkeypatch):
+    """call.conference.created event is handled without error."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    voice._active_calls["cc-conf-1"] = adapter.CallSession(
+        call_control_id="cc-conf-1",
+        call_session_id="sess-conf",
+        client_state="cs-conf",
+        caller_number="+15550000001",
+        dialed_number="+15550000002",
+        direction="outbound",
+        state="answered",
+        started_at=0,
+    )
+
+    payload = {
+        "data": {
+            "event_type": "call.conference.created",
+            "payload": {
+                "id": "evt-conf-1",
+                "call_control_id": "cc-conf-1",
+                "direction": "outgoing",
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    assert response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_recording_started_webhook_is_logged(monkeypatch):
+    """call.recording.started event is handled without error."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    voice._active_calls["cc-rec-1"] = adapter.CallSession(
+        call_control_id="cc-rec-1",
+        call_session_id="sess-rec",
+        client_state="cs-rec",
+        caller_number="+15550000001",
+        dialed_number="+15550000002",
+        direction="outbound",
+        state="answered",
+        started_at=0,
+    )
+
+    payload = {
+        "data": {
+            "event_type": "call.recording.started",
+            "payload": {
+                "id": "evt-rec-1",
+                "call_control_id": "cc-rec-1",
+                "direction": "outgoing",
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    assert response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_transferred_webhook_is_logged(monkeypatch):
+    """call.transferred event is handled without error."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    voice._active_calls["cc-xfer-1"] = adapter.CallSession(
+        call_control_id="cc-xfer-1",
+        call_session_id="sess-xfer",
+        client_state="cs-xfer",
+        caller_number="+15550000001",
+        dialed_number="+15550000002",
+        direction="outbound",
+        state="answered",
+        started_at=0,
+    )
+
+    payload = {
+        "data": {
+            "event_type": "call.transferred",
+            "payload": {
+                "id": "evt-xfer-1",
+                "call_control_id": "cc-xfer-1",
+                "direction": "outgoing",
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    assert response.status == 200
+
+
+# ---------------------------------------------------------------------------
+# Auto-provisioning
+# ---------------------------------------------------------------------------
+
+
+def test_provisioning_state_round_trip(tmp_path):
+    """Provisioned state can be saved and loaded."""
+    result = ProvisioningResult(
+        application_id="app-123",
+        connection_id="conn-456",
+        from_number="+15550009999",
+        number_order_id="order-789",
+    )
+    state = ProvisionedState(result=result, provisioned_at="2026-05-24T00:00:00+00:00")
+    save_provisioned_state(state, store_path=str(tmp_path))
+
+    loaded = load_provisioned_state(store_path=str(tmp_path))
+    assert loaded is not None
+    assert loaded.result.connection_id == "conn-456"
+    assert loaded.result.from_number == "+15550009999"
+    assert loaded.provisioned_at == "2026-05-24T00:00:00+00:00"
+
+
+def test_provisioning_state_missing_returns_none(tmp_path):
+    assert load_provisioned_state(store_path=str(tmp_path)) is None
+
+
+def test_provisioning_state_delete_is_idempotent(tmp_path):
+    """Deleting state when none exists does not raise."""
+    delete_provisioned_state(store_path=str(tmp_path))
+    delete_provisioned_state(store_path=str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_provision_skips_when_already_configured(monkeypatch):
+    """provision() returns immediately when both connection_id and from_number are set."""
+    result = await adapter.provision(
+        "KEY_test",
+        "https://example.com/webhook",
+        connection_id="conn-existing",
+        from_number="+15550000001",
+    )
+    assert result.connection_id == "conn-existing"
+    assert result.from_number == "+15550000001"
+    assert result.number_order_id == ""
+
+
+@pytest.mark.asyncio
+async def test_provision_loads_persisted_state(tmp_path, monkeypatch):
+    """provision() returns persisted state if provisioned.json exists."""
+    from provisioning import save_provisioned_state, ProvisionedState, ProvisioningResult
+
+    existing = ProvisionedState(
+        result=ProvisioningResult(
+            application_id="app-persisted",
+            connection_id="conn-persisted",
+            from_number="+15550008888",
+            number_order_id="order-persisted",
+        ),
+        provisioned_at="2026-01-01T00:00:00+00:00",
+    )
+    save_provisioned_state(existing, store_path=str(tmp_path))
+
+    result = await adapter.provision(
+        "KEY_test",
+        "https://example.com/webhook",
+        store_path=str(tmp_path),
+    )
+    assert result.connection_id == "conn-persisted"
+    assert result.from_number == "+15550008888"

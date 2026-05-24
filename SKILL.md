@@ -14,7 +14,7 @@ Use Telnyx Call Control as a first-class Hermes platform adapter for voice calls
 
 ```bash
 mkdir -p ~/.hermes/plugins/telnyx_voice_call
-cp __init__.py adapter.py plugin.yaml ~/.hermes/plugins/telnyx_voice_call/
+cp __init__.py adapter.py provisioning.py plugin.yaml ~/.hermes/plugins/telnyx_voice_call/
 hermes plugins list
 hermes plugins enable telnyx-voice-call-platform
 ```
@@ -22,6 +22,21 @@ hermes plugins enable telnyx-voice-call-platform
 Restart the Hermes gateway after enabling the plugin.
 
 ## Configuration
+
+### Auto-provision mode (recommended)
+
+Set only the API key and enable auto-provisioning:
+
+```bash
+export TELNYX_API_KEY="KEY..."
+export TELNYX_VOICE_AUTO_PROVISION=true
+```
+
+The adapter will automatically create a Call Control application and order a
+phone number on connect. On disconnect, auto-provisioned resources are cleaned
+up.
+
+### Manual mode
 
 Required:
 
@@ -31,6 +46,8 @@ export TELNYX_VOICE_FROM_NUMBER="+15551234567"
 export TELNYX_CALL_CONTROL_CONNECTION_ID="1234567890"
 ```
 
+Find your connection ID at [Mission Control → Call Control](https://portal.telnyx.com/#/app/call-control/applications).
+
 Recommended production hardening:
 
 ```bash
@@ -39,6 +56,8 @@ export TELNYX_VOICE_REQUIRE_SIGNATURE=true
 export TELNYX_VOICE_ALLOWED_USERS="+15551230001,+15551230002"
 export TELNYX_VOICE_ALLOW_ALL_USERS=false
 ```
+
+Find your public key at [Mission Control → Public Key](https://portal.telnyx.com/#/app/account/public-key).
 
 Optional:
 
@@ -66,7 +85,20 @@ gateway:
 
 Or rely on env-driven enablement when `TELNYX_API_KEY`,
 `TELNYX_VOICE_FROM_NUMBER`, and `TELNYX_CALL_CONTROL_CONNECTION_ID` are set and
-the plugin is enabled.
+the plugin is enabled. With `TELNYX_VOICE_AUTO_PROVISION=true`, only the API
+key is required.
+
+## Call control actions
+
+The adapter exposes these Call Control methods:
+
+| Method | Telnyx API | Description |
+|--------|-----------|-------------|
+| `hangup(call_control_id)` | `/calls/{id}/actions/hangup` | Hang up an active call |
+| `create_conference(call_control_id, name)` | `/calls/{id}/actions/conference` | Add a call leg to a conference bridge |
+| `start_recording(call_control_id)` | `/calls/{id}/actions/record_start` | Start recording a call |
+| `stop_recording(call_control_id)` | `/calls/{id}/actions/record_stop` | Stop recording a call |
+| `transfer_call(call_control_id, to)` | `/calls/{id}/actions/transfer` | Transfer a call to another destination |
 
 ## Webhook
 
@@ -76,9 +108,16 @@ Configure the Telnyx Call Control application inbound webhook to:
 https://your-public-host.example/webhooks/telnyx/voice
 ```
 
-The adapter accepts inbound call events (`call.initiated`, `call.answered`,
-`call.transcription`, `call.dtmf.received`, `call.hangup`) and ignores
-lifecycle events.
+The adapter handles these events:
+- `call.initiated` — answers inbound calls, speaks greeting
+- `call.answered` — drains queued speak for outbound calls
+- `call.transcription` — forwards transcript to Hermes
+- `call.dtmf.received` — forwards digit presses to Hermes
+- `call.conference.created` — logs conference creation
+- `call.recording.started` — logs recording start
+- `call.transferred` — logs call transfer
+- `call.hangup` — cleans up call state and pending speak
+- `call.bridged`, `call.recording.saved`, `call.speak.started`, `call.speak.ended` — passive lifecycle events
 
 ## Tests
 
