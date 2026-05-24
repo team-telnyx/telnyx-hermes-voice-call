@@ -745,12 +745,22 @@ async def _standalone_send(
     media_files=None,
     force_document: bool = False,
 ) -> dict:
-    """Out-of-process cron delivery support."""
-    adapter = TelnyxVoiceCallAdapter(pconfig)
-    result = await adapter.send(chat_id, message)
-    if result.success:
-        return {"success": True, "message_id": result.message_id}
-    return {"error": result.error or "Telnyx Voice Call send failed"}
+    """Out-of-process cron delivery support.
+
+    Connects the adapter (webhook server + HTTP session), sends the message,
+    then disconnects to clean up.
+    """
+    voice = TelnyxVoiceCallAdapter(pconfig)
+    connected = await voice.connect()
+    if not connected:
+        return {"error": "Telnyx Voice Call adapter failed to connect"}
+    try:
+        result = await voice.send(chat_id, message)
+        if result.success:
+            return {"success": True, "message_id": result.message_id}
+        return {"error": result.error or "Telnyx Voice Call send failed"}
+    finally:
+        await voice.disconnect()
 
 
 def register(ctx) -> None:

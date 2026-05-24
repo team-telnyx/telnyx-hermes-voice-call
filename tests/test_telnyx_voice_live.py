@@ -28,6 +28,11 @@ async def test_live_outbound_call_smoke(monkeypatch):
         pytest.skip("TELNYX_VOICE_LIVE_TO_NUMBER is required for live call test")
 
     voice = adapter.TelnyxVoiceCallAdapter(PlatformConfig(enabled=True, extra={}))
-    result = await voice.send(to_number, "Hermes Telnyx voice-call live smoke test.")
-    assert result.success is True
-    assert result.message_id
+    connected = await voice.connect()
+    assert connected is True, "adapter must connect before sending"
+    try:
+        result = await voice.send(to_number, "Hermes Telnyx voice-call live smoke test.")
+        assert result.success is True
+        assert result.message_id
+    finally:
+        await voice.disconnect()
