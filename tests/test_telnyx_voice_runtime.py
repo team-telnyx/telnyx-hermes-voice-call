@@ -148,7 +148,10 @@ async def test_send_to_phone_number_creates_call(monkeypatch):
     assert fake.posts[0]["json"]["connection_id"] == "conn-123"
     assert fake.posts[0]["json"]["from"] == "+15550000001"
     assert fake.posts[0]["json"]["to"] == "+15550000002"
-    assert fake.posts[1]["url"] == "https://api.telnyx.com/v2/calls/cc-out-123/actions/speak"
+    # Speak is queued for call.answered, not sent immediately
+    assert "cc-out-123" in voice._pending_speak
+    assert voice._pending_speak["cc-out-123"] == "Hello by phone"
+    assert len(fake.posts) == 1  # only the /calls POST, no immediate speak
 
 
 @pytest.mark.asyncio
@@ -157,6 +160,16 @@ async def test_send_rejects_invalid_target(monkeypatch):
     result = await voice.send("not-a-number", "hello")
     assert result.success is False
     assert "Expected E.164" in result.error
+
+
+@pytest.mark.asyncio
+async def test_post_json_returns_error_without_session(monkeypatch):
+    """_post_json should return an error dict, not create a leaked session."""
+    voice = make_adapter(monkeypatch)
+    voice._http_session = None  # not connected
+    result = await voice._post_json("/calls", {})
+    assert result.get("error")
+    assert "not initialised" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +281,12 @@ async def test_handle_inbound_call_answers_and_emits_message(monkeypatch):
     request._read_bytes = json.dumps(payload).encode()
 
     response = await voice._handle_webhook(request)
-    await __import__("asyncio").sleep(0)
-
+    # Webhook should ACK immediately (background tasks process answer + greet)
     assert response.status == 200
+
+    # Give background tasks time to complete
+    await __import__("asyncio").sleep(0.05)
+
     assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-in-123/actions/answer"
     assert fake.posts[1]["url"] == "https://api.telnyx.com/v2/calls/cc-in-123/actions/speak"
     assert len(captured) == 1
@@ -360,28 +376,20 @@ def test_signature_verification_with_base64_keypair(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_outbound_call_queues_speak_on_422(monkeypatch):
-    """When Telnyx rejects immediate speak (422), text is queued for call.answered."""
+async def test_outbound_call_queues_speak_for_answered(monkeypatch):
+    """Outbound call queues speak for call.answered instead of sending immediately."""
     voice = make_adapter(monkeypatch)
     fake = FakeSession()
     voice._http_session = fake
 
-    # Override FakeSession to return 422 on speak (call not answered yet)
-    class SpeakRejectSession(FakeSession):
-        def post(self, url, json=None, headers=None):
-            self.posts.append({"url": url, "json": json, "headers": headers})
-            if url.endswith("/calls"):
-                return FakeResponse(body={"data": {"call_control_id": "cc-out-422"}})
-            if "/actions/speak" in url:
-                return FakeResponse(status=422, body={"errors": [{"code": 90008, "title": "Call is not in progress"}]})
-            return FakeResponse()
-
-    voice._http_session = SpeakRejectSession()
     result = await voice.send("+15550000002", "Hello queued")
     assert result.success is True
-    assert result.message_id == "cc-out-422"
-    # Text should be queued, not lost
-    assert voice._pending_speak.get("cc-out-422") == "Hello queued"
+    assert result.message_id == "cc-out-123"
+    # Only the /calls POST; no immediate speak attempt
+    assert len(fake.posts) == 1
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls"
+    # Text is queued for delivery on call.answered
+    assert voice._pending_speak.get("cc-out-123") == "Hello queued"
 
 
 @pytest.mark.asyncio
@@ -426,12 +434,14 @@ async def test_call_answered_drains_queued_speak(monkeypatch):
     request._read_bytes = json.dumps(payload).encode()
 
     response = await voice._handle_webhook(request)
-    await __import__("asyncio").sleep(0)
-
+    # Webhook should ACK immediately
     assert response.status == 200
+
+    # Give background task time to process
+    await __import__("asyncio").sleep(0.05)
+
     # Queued speak should have been delivered
     assert "cc-ans-1" not in voice._pending_speak
-    # First post is the speak, second is the answered event
     speak_posts = [p for p in fake.posts if "/actions/speak" in p["url"]]
     assert len(speak_posts) == 1
     assert speak_posts[0]["json"]["payload"] == "Queued message"
@@ -589,6 +599,36 @@ async def test_transferred_webhook_is_logged(monkeypatch):
     assert response.status == 200
 
 
+def test_extract_transcript_filters_interim_results():
+    """Interim (non-final) transcripts should be suppressed."""
+    voice = adapter.TelnyxVoiceCallAdapter(PlatformConfig(enabled=True, extra={}))
+
+    # is_final=False → should return empty string
+    interim = voice._extract_transcript({
+        "transcription_data": {"transcript": "Hel", "is_final": False}
+    })
+    assert interim == ""
+
+    # is_final=True → should return the transcript
+    final = voice._extract_transcript({
+        "transcription_data": {"transcript": "Hello", "is_final": True}
+    })
+    assert final == "Hello"
+
+    # is_final missing (legacy / non-streaming) → should still surface
+    legacy = voice._extract_transcript({
+        "transcription_data": {"transcript": "Hello world"}
+    })
+    assert legacy == "Hello world"
+
+
+def test_extract_transcript_no_transcription_data():
+    """Transcripts without transcription_data fall back to top-level field."""
+    voice = adapter.TelnyxVoiceCallAdapter(PlatformConfig(enabled=True, extra={}))
+    result = voice._extract_transcript({"transcription": "fallback text"})
+    assert result == "fallback text"
+
+
 # ---------------------------------------------------------------------------
 # Auto-provisioning
 # ---------------------------------------------------------------------------
@@ -601,6 +641,7 @@ def test_provisioning_state_round_trip(tmp_path):
         connection_id="conn-456",
         from_number="+15550009999",
         number_order_id="order-789",
+        phone_number_id="pn-001",
     )
     state = ProvisionedState(result=result, provisioned_at="2026-05-24T00:00:00+00:00")
     save_provisioned_state(state, store_path=str(tmp_path))
@@ -609,6 +650,7 @@ def test_provisioning_state_round_trip(tmp_path):
     assert loaded is not None
     assert loaded.result.connection_id == "conn-456"
     assert loaded.result.from_number == "+15550009999"
+    assert loaded.result.phone_number_id == "pn-001"
     assert loaded.provisioned_at == "2026-05-24T00:00:00+00:00"
 
 

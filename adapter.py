@@ -393,12 +393,11 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 state="initiated",
                 started_at=time.time(),
             )
-            # Try speak immediately; if Telnyx rejects it (call not yet
-            # answered), queue the text for delivery on call.answered.
-            speak_result = await self._speak(call_control_id, text)
-            if not speak_result.success:
-                logger.info("[telnyx_voice_call] outbound call created; queuing speak for call.answered: %s", speak_result.error)
-                self._pending_speak[call_control_id] = text
+            # Queue the speak for delivery on call.answered — the call
+            # is never answered yet at this point so an immediate speak would
+            # always 422 and waste a roundtrip.
+            self._pending_speak[call_control_id] = text
+            logger.info("[telnyx_voice_call] outbound call created; speak queued for call.answered")
             return SendResult(success=True, message_id=call_control_id, raw_response=response)
         return SendResult(success=True, raw_response=response)
 
@@ -406,6 +405,7 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         if not call_control_id:
             return SendResult(success=False, error="Missing call_control_id")
         if len(text) > MAX_SPEAK_LENGTH:
+            logger.warning("[telnyx_voice_call] speak text truncated from %d to %d chars for %s", len(text), MAX_SPEAK_LENGTH, call_control_id)
             text = text[:MAX_SPEAK_LENGTH]
         payload = {
             "command_id": f"hermes-speak-{uuid.uuid4()}",
@@ -490,8 +490,9 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
     async def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         import aiohttp
 
-        session = self._http_session or aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
-        own_session = session is not self._http_session
+        if not self._http_session:
+            return {"error": "HTTP session not initialised — adapter not connected", "retryable": True}
+        session = self._http_session
         url = f"{self._api_base}{path}"
         try:
             async with session.post(url, json=payload, headers={"Authorization": f"Bearer {self._api_key}"}) as resp:
@@ -511,9 +512,6 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 return {"error": f"{message} (HTTP {resp.status})", "status": resp.status, "body": body, "retryable": resp.status >= 500}
         except aiohttp.ClientError as exc:
             return {"error": str(exc), "retryable": True}
-        finally:
-            if own_session:
-                await session.close()
 
     async def _handle_webhook(self, request):
         from aiohttp import web
@@ -537,19 +535,32 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         session = self._record_call_session(event_payload, call_control_id, event_type)
 
         if event_type == "call.initiated" and session.direction == "inbound":
-            await self._answer(call_control_id)
-            if self._greeting:
-                await self._speak(call_control_id, self._greeting)
-            await self._emit_call_event(payload, session, call_control_id, "Incoming Telnyx voice call")
+            # Answer + greet in the background so the webhook ACK returns
+            # immediately.  Telnyx retries webhooks that don't respond fast
+            # enough, which would cause double-answer.
+            async def _handle_initiated():
+                await self._answer(call_control_id)
+                if self._greeting:
+                    await self._speak(call_control_id, self._greeting)
+                await self._emit_call_event(payload, session, call_control_id, "Incoming Telnyx voice call")
+
+            task = asyncio.ensure_future(_handle_initiated())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         elif event_type == "call.answered":
             session.state = "answered"
-            # Drain any queued speak from before the call was answered.
-            queued_text = self._pending_speak.pop(call_control_id, None)
-            if queued_text:
-                logger.info("[telnyx_voice_call] delivering queued speak for %s", call_control_id)
-                await self._speak(call_control_id, queued_text)
-            # Surface answered events so the agent can decide what to say next.
-            await self._emit_call_event(payload, session, call_control_id, "Telnyx voice call answered")
+            # Process answered in the background too (speak + emit can be
+            # slow) and ack the webhook immediately.
+            async def _handle_answered():
+                queued_text = self._pending_speak.pop(call_control_id, None)
+                if queued_text:
+                    logger.info("[telnyx_voice_call] delivering queued speak for %s", call_control_id)
+                    await self._speak(call_control_id, queued_text)
+                await self._emit_call_event(payload, session, call_control_id, "Telnyx voice call answered")
+
+            task = asyncio.ensure_future(_handle_answered())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         elif event_type == "call.transcription":
             transcript = self._extract_transcript(event_payload)
             if transcript:
@@ -608,6 +619,11 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
     def _extract_transcript(self, event_payload: dict[str, Any]) -> str:
         data = event_payload.get("transcription_data")
         if isinstance(data, dict):
+            # Only surface final transcripts to avoid firing on every
+            # interim partial result during real-time transcription.
+            is_final = data.get("is_final")
+            if is_final is False:
+                return ""
             transcript = data.get("transcript")
             if transcript:
                 return str(transcript).strip()
