@@ -35,8 +35,11 @@ TELNYX_API_BASE = "https://api.telnyx.com/v2"
 DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 DEFAULT_WEBHOOK_PORT = 8088
 DEFAULT_WEBHOOK_PATH = "/webhooks/telnyx/voice"
+DEFAULT_WS_PATH = "/ws/telnyx/voice/stream"
 DEFAULT_VOICE = "Telnyx.NaturalHD.astra"
 DEFAULT_LANGUAGE = "en-US"
+DEFAULT_STREAM_TRACK = "inbound_track"
+DEFAULT_STREAM_CODEC = "PCMU"
 MAX_SPEAK_LENGTH = 5000
 WEBHOOK_BODY_MAX_BYTES = 1_048_576
 E164_RE = re.compile(r"^\+[1-9]\d{1,14}$")
@@ -184,6 +187,11 @@ def _env_enablement() -> dict | None:
     webhook_url = _env("TELNYX_VOICE_WEBHOOK_URL")
     if webhook_url:
         seed["webhook_url"] = webhook_url
+    stream_url = _env("TELNYX_VOICE_STREAM_URL")
+    if stream_url:
+        seed["stream_url"] = stream_url
+        seed["stream_track"] = _env("TELNYX_VOICE_STREAM_TRACK") or DEFAULT_STREAM_TRACK
+        seed["stream_codec"] = _env("TELNYX_VOICE_STREAM_CODEC") or DEFAULT_STREAM_CODEC
     home = _env("TELNYX_VOICE_HOME_CHANNEL")
     if home:
         seed["home_channel"] = {"chat_id": home, "name": home}
@@ -221,8 +229,20 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         except ValueError:
             self._signature_tolerance = 300
         self._auto_provision = _truthy(_env("TELNYX_VOICE_AUTO_PROVISION") or str(extra.get("auto_provision", ""))) or DEFAULT_AUTO_PROVISION
+        # Media streaming config
+        self._stream_url = _env("TELNYX_VOICE_STREAM_URL") or str(extra.get("stream_url", "")).strip()
+        self._stream_track = _env("TELNYX_VOICE_STREAM_TRACK") or str(extra.get("stream_track", DEFAULT_STREAM_TRACK))
+        self._stream_codec = _env("TELNYX_VOICE_STREAM_CODEC") or str(extra.get("stream_codec", DEFAULT_STREAM_CODEC))
+        self._ws_host = _env("TELNYX_VOICE_WS_HOST") or str(extra.get("ws_host", self._webhook_host))
+        try:
+            self._ws_port = int(_env("TELNYX_VOICE_WS_PORT") or str(extra.get("ws_port", str(self._webhook_port))))
+        except ValueError:
+            self._ws_port = self._webhook_port
+        self._ws_path = _env("TELNYX_VOICE_WS_PATH") or str(extra.get("ws_path", DEFAULT_WS_PATH))
         self._active_calls: dict[str, CallSession] = {}
         self._pending_speak: dict[str, str] = {}  # call_control_id → queued text
+        self._active_streams: dict[str, str] = {}  # call_control_id → stream_id
+        self._ws_connections: dict[str, Any] = {}  # stream_id → websocket
         self._replay_cache: dict[str, float] = {}
         self._provisioned: Optional[ProvisioningResult] = None
         self._runner = None
@@ -290,6 +310,8 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         app = web.Application(client_max_size=WEBHOOK_BODY_MAX_BYTES)
         app.router.add_post(self._webhook_path, self._handle_webhook)
         app.router.add_get("/health", lambda _: web.Response(text="ok"))
+        # WebSocket endpoint for Telnyx media streaming frames
+        app.router.add_get(self._ws_path, self._handle_websocket)
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -307,6 +329,20 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        # Stop any active media streams.
+        for cc_id, stream_id in list(self._active_streams.items()):
+            try:
+                await self.streaming_stop(cc_id, stream_id=stream_id)
+            except Exception as exc:
+                logger.warning("[telnyx_voice_call] streaming_stop on disconnect failed for %s: %s", cc_id, exc)
+        self._active_streams.clear()
+        # Close any open WebSocket connections.
+        for sid, ws in list(self._ws_connections.items()):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        self._ws_connections.clear()
         if self._http_session:
             await self._http_session.close()
             self._http_session = None
@@ -478,6 +514,72 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
         return SendResult(success=True, message_id=call_control_id, raw_response=response)
 
+    # ------------------------------------------------------------------
+    # Media streaming actions
+    # ------------------------------------------------------------------
+
+    async def streaming_start(
+        self,
+        call_control_id: str,
+        *,
+        stream_url: Optional[str] = None,
+        stream_track: Optional[str] = None,
+        stream_codec: Optional[str] = None,
+        bidirectional_mode: Optional[str] = None,
+        bidirectional_codec: Optional[str] = None,
+        bidirectional_sampling_rate: Optional[int] = None,
+        bidirectional_target_legs: Optional[str] = None,
+    ) -> SendResult:
+        """Start media streaming for a call to a WebSocket endpoint.
+
+        If ``stream_url`` is not provided, the adapter-level
+        ``TELNYX_VOICE_STREAM_URL`` is used.  When neither is set the
+        command is rejected (streaming requires a destination).
+        """
+        dest_url = stream_url or self._stream_url
+        if not dest_url:
+            return SendResult(success=False, error="No stream_url configured — set TELNYX_VOICE_STREAM_URL or pass stream_url")
+        payload: dict[str, Any] = {
+            "command_id": f"hermes-stream-start-{uuid.uuid4()}",
+            "stream_url": dest_url,
+            "stream_track": stream_track or self._stream_track,
+            "stream_codec": stream_codec or self._stream_codec,
+        }
+        if bidirectional_mode:
+            payload["stream_bidirectional_mode"] = bidirectional_mode
+        if bidirectional_codec:
+            payload["stream_bidirectional_codec"] = bidirectional_codec
+        if bidirectional_sampling_rate is not None:
+            payload["stream_bidirectional_sampling_rate"] = bidirectional_sampling_rate
+        if bidirectional_target_legs:
+            payload["stream_bidirectional_target_legs"] = bidirectional_target_legs
+        response = await self._post_json(f"/calls/{call_control_id}/actions/streaming_start", payload)
+        if response.get("error"):
+            return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
+        return SendResult(success=True, message_id=call_control_id, raw_response=response)
+
+    async def streaming_stop(
+        self,
+        call_control_id: str,
+        *,
+        stream_id: Optional[str] = None,
+    ) -> SendResult:
+        """Stop media streaming for a call.
+
+        If ``stream_id`` is provided only that stream is stopped;
+        otherwise all streams for the call are stopped.
+        """
+        payload: dict[str, Any] = {
+            "command_id": f"hermes-stream-stop-{uuid.uuid4()}",
+        }
+        if stream_id:
+            payload["stream_id"] = stream_id
+        response = await self._post_json(f"/calls/{call_control_id}/actions/streaming_stop", payload)
+        if response.get("error"):
+            return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
+        self._active_streams.pop(call_control_id, None)
+        return SendResult(success=True, message_id=call_control_id, raw_response=response)
+
     async def _answer(self, call_control_id: str) -> SendResult:
         response = await self._post_json(
             f"/calls/{call_control_id}/actions/answer",
@@ -549,9 +651,16 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             task.add_done_callback(self._background_tasks.discard)
         elif event_type == "call.answered":
             session.state = "answered"
-            # Process answered in the background too (speak + emit can be
-            # slow) and ack the webhook immediately.
+            # Process answered in the background too (speak + stream + emit
+            # can be slow) and ack the webhook immediately.
             async def _handle_answered():
+                # Auto-start media streaming if a stream URL is configured.
+                if self._stream_url:
+                    stream_result = await self.streaming_start(call_control_id)
+                    if stream_result.success:
+                        logger.info("[telnyx_voice_call] auto-started media stream for %s", call_control_id)
+                    else:
+                        logger.warning("[telnyx_voice_call] auto-start stream failed for %s: %s", call_control_id, stream_result.error)
                 queued_text = self._pending_speak.pop(call_control_id, None)
                 if queued_text:
                     logger.info("[telnyx_voice_call] delivering queued speak for %s", call_control_id)
@@ -572,6 +681,20 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         elif event_type == "call.hangup":
             session.state = "ended"
             self._pending_speak.pop(call_control_id, None)
+            # Stop any active media stream on hangup.
+            stream_id = self._active_streams.pop(call_control_id, None)
+            if stream_id or self._stream_url:
+                try:
+                    await self.streaming_stop(call_control_id, stream_id=stream_id)
+                except Exception as exc:
+                    logger.warning("[telnyx_voice_call] streaming_stop on hangup failed for %s: %s", call_control_id, exc)
+            # Close any associated WebSocket connection.
+            ws = self._ws_connections.pop(stream_id, None) if stream_id else None
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
             await self._emit_call_event(payload, session, call_control_id, "Call ended")
             self._active_calls.pop(call_control_id, None)
             logger.info("[telnyx_voice_call] call ended for %s", call_control_id)
@@ -581,6 +704,20 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             logger.info("[telnyx_voice_call] recording started for %s", call_control_id)
         elif event_type == "call.transferred":
             logger.info("[telnyx_voice_call] call transferred for %s", call_control_id)
+        elif event_type == "streaming.started":
+            stream_id = str(event_payload.get("stream_id") or "")
+            if stream_id:
+                self._active_streams[call_control_id] = stream_id
+            logger.info("[telnyx_voice_call] media streaming started for %s (stream_id=%s)", call_control_id, stream_id)
+        elif event_type == "streaming.stopped":
+            old_stream_id = self._active_streams.pop(call_control_id, None)
+            ws = self._ws_connections.pop(old_stream_id, None) if old_stream_id else None
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            logger.info("[telnyx_voice_call] media streaming stopped for %s", call_control_id)
         elif event_type in {"call.bridged", "call.recording.saved", "call.speak.started", "call.speak.ended"}:
             logger.info("[telnyx_voice_call] received lifecycle event %s for %s", event_type, call_control_id)
         else:
@@ -703,6 +840,128 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 return False
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # WebSocket handler for Telnyx media frames
+    # ------------------------------------------------------------------
+
+    async def _handle_websocket(self, request) -> None:
+        """Handle an incoming WebSocket connection from Telnyx media streaming.
+
+        v1 behaviour: validate, ack, log events conservatively.
+        The WebSocket receives Telnyx media frames (``connected``, ``start``,
+        ``media``, ``stop``, ``dtmf``, ``mark``, ``error``) as JSON.  In this
+        version we log each event and close cleanly on ``stop`` / ``error``.
+        Future versions can forward frames to the Hermes event bus or
+        integrate with an ASR/TTS pipeline for bidirectional real-time voice.
+        """
+        from aiohttp import web
+        import aiohttp
+        import json as _json
+
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        stream_id: str = ""
+        call_control_id: str = ""
+
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        frame = _json.loads(msg.data)
+                    except Exception:
+                        logger.warning("[telnyx_voice_call] ws: non-JSON frame received")
+                        continue
+
+                    event = str(frame.get("event", ""))
+
+                    if event == "connected":
+                        logger.info("[telnyx_voice_call] ws: Telnyx media stream connected (version=%s)", frame.get("version"))
+
+                    elif event == "start":
+                        stream_id = str(frame.get("stream_id", ""))
+                        start_data = frame.get("start", {})
+                        call_control_id = str(start_data.get("call_control_id", ""))
+                        media_format = start_data.get("media_format", {})
+                        if stream_id:
+                            self._ws_connections[stream_id] = ws
+                            # Also track the stream_id for this call
+                            if call_control_id:
+                                self._active_streams[call_control_id] = stream_id
+                        logger.info(
+                            "[telnyx_voice_call] ws: stream started id=%s call=%s encoding=%s rate=%s",
+                            stream_id,
+                            call_control_id,
+                            media_format.get("encoding"),
+                            media_format.get("sample_rate"),
+                        )
+
+                    elif event == "media":
+                        # v1: log at debug level only — real-time media frames
+                        # are very high volume.  Future: forward to ASR pipeline.
+                        media_data = frame.get("media", {})
+                        logger.debug(
+                            "[telnyx_voice_call] ws: media frame track=%s chunk=%s seq=%s",
+                            media_data.get("track"),
+                            media_data.get("chunk"),
+                            frame.get("sequence_number"),
+                        )
+
+                    elif event == "dtmf":
+                        digit = str(frame.get("dtmf", {}).get("digit", ""))
+                        logger.info("[telnyx_voice_call] ws: DTMF digit=%s stream=%s", digit, stream_id)
+                        # Emit as a Hermes message event if call_control_id is known
+                        if call_control_id:
+                            session = self._active_calls.get(call_control_id)
+                            if session:
+                                await self._emit_call_event(
+                                    {"data": {"event_type": "call.dtmf.received", "payload": {"call_control_id": call_control_id}}},
+                                    session,
+                                    call_control_id,
+                                    f"Caller pressed {digit} (via media stream)",
+                                )
+
+                    elif event == "mark":
+                        mark_name = str(frame.get("mark", {}).get("name", ""))
+                        logger.debug("[telnyx_voice_call] ws: mark name=%s stream=%s", mark_name, stream_id)
+
+                    elif event == "stop":
+                        stop_data = frame.get("stop", {})
+                        logger.info(
+                            "[telnyx_voice_call] ws: stream stopped call=%s stream=%s",
+                            stop_data.get("call_control_id"),
+                            stream_id,
+                        )
+                        self._ws_connections.pop(stream_id, None)
+                        if call_control_id:
+                            self._active_streams.pop(call_control_id, None)
+                        break
+
+                    elif event == "error":
+                        error_data = frame.get("payload", {})
+                        logger.error(
+                            "[telnyx_voice_call] ws: error code=%s title=%s detail=%s stream=%s",
+                            error_data.get("code"),
+                            error_data.get("title"),
+                            error_data.get("detail"),
+                            stream_id,
+                        )
+                        break
+
+                    else:
+                        logger.debug("[telnyx_voice_call] ws: unknown event %s", event)
+
+                elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                    logger.info("[telnyx_voice_call] ws: connection closed/error")
+                    break
+        finally:
+            self._ws_connections.pop(stream_id, None)
+            if call_control_id:
+                self._active_streams.pop(call_control_id, None)
+            logger.info("[telnyx_voice_call] ws: connection teardown stream=%s call=%s", stream_id, call_control_id)
+
+        return ws
 
     def _validate_telnyx_signature(self, body: bytes, headers: Dict[str, str]) -> bool:
         if not (self._public_key or self._require_signature):

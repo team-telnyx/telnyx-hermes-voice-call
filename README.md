@@ -35,9 +35,14 @@ and webhook behavior with the finalized OpenClaw voice-call plugin.
 - Creates outbound calls for E.164 targets
 - Handles `call.initiated`, `call.answered`, `call.transcription`,
   `call.dtmf.received`, `call.conference.created`, `call.recording.started`,
-  `call.transferred`, and `call.hangup` events
+  `call.transferred`, `call.hangup`, `streaming.started`, `streaming.stopped`
+  events
 - Supports Telnyx Ed25519 webhook signature verification with replay protection
-- **Call control actions:** hangup, conference, recording (start/stop), transfer
+- **Call control actions:** hangup, conference, recording (start/stop), transfer,
+  streaming (start/stop)
+- **Media streaming:** real-time bidirectional audio over WebSockets via Telnyx
+  Call Control `streaming_start`/`streaming_stop`, with a built-in WebSocket
+  endpoint for receiving media frames
 - **Auto-provisioning:** optionally creates a Call Control app + orders a phone
   number when the adapter connects, so the agent becomes a phone number on enable
 - Env-driven enablement, cron/home-channel delivery, standalone sender support,
@@ -171,9 +176,84 @@ The adapter exposes call control methods that can be invoked programmatically:
 | `start_recording(call_control_id)` | `POST /calls/{id}/actions/record_start` | Start recording a call |
 | `stop_recording(call_control_id)` | `POST /calls/{id}/actions/record_stop` | Stop recording a call |
 | `transfer_call(call_control_id, to)` | `POST /calls/{id}/actions/transfer` | Transfer a call to another destination |
+| `streaming_start(call_control_id, **)` | `POST /calls/{id}/actions/streaming_start` | Start media streaming to a WebSocket |
+| `streaming_stop(call_control_id, **)` | `POST /calls/{id}/actions/streaming_stop` | Stop media streaming |
 
 All methods return `SendResult` with `success=True/False` and error details on
 failure.
+
+## Media streaming
+
+The adapter supports Telnyx media streaming over WebSockets for real-time
+voice AI pipelines. This enables bidirectional audio between the caller and
+your ASR/TTS/LLM stack.
+
+### Simple mode (default)
+
+Without streaming configured, Hermes replies are delivered via Call Control
+`speak` actions — text-to-speech rendered by Telnyx. This works well for
+conversational agents that don't need real-time audio processing.
+
+### Streaming mode
+
+Set `TELNYX_VOICE_STREAM_URL` to enable media streaming. When configured:
+
+1. On `call.answered`, the adapter automatically calls `streaming_start` with
+   the configured WebSocket URL, track, and codec.
+2. Telnyx opens a WebSocket connection to your server and delivers real-time
+   audio frames as base64-encoded RTP payloads wrapped in JSON.
+3. The adapter includes a built-in WebSocket endpoint (`/ws/telnyx/voice/stream`)
+   that receives and logs Telnyx media frames. In v1, this validates/acks/records
+   events conservatively. Future versions will integrate with ASR/TTS pipelines.
+4. On `call.hangup`, `streaming_stop` is called automatically and the WebSocket
+   connection is cleaned up.
+
+### Streaming events
+
+The adapter handles these streaming-related webhook events:
+
+- `streaming.started` — records the `stream_id` for cleanup tracking
+- `streaming.stopped` — cleans up the stream and closes the WebSocket
+
+### WebSocket frame types
+
+The built-in WebSocket handler processes these Telnyx frame types:
+
+| Event | Description |
+|-------|-------------|
+| `connected` | WebSocket connection established |
+| `start` | Stream begins; includes `stream_id`, `call_control_id`, `media_format` |
+| `media` | Audio frame (base64 RTP payload). Logged at debug level (high volume) |
+| `dtmf` | DTMF digit detected; emitted as Hermes message event |
+| `mark` | Mark message (for media playback tracking) |
+| `stop` | Stream ended |
+| `error` | Stream error |
+
+### Bidirectional streaming
+
+For real-time voice AI, enable bidirectional streaming:
+
+```python
+result = await voice.streaming_start(
+    call_control_id,
+    stream_url="wss://your-server.com/ws",
+    stream_track="both_tracks",
+    bidirectional_mode="rtp",
+    bidirectional_codec="G722",
+    bidirectional_sampling_rate=16000,
+    bidirectional_target_legs="both",
+)
+```
+
+Bidirectional streaming lets you send audio back into the call via the
+WebSocket, enabling low-latency speech-to-speech AI agent loops.
+
+### Custom WebSocket server
+
+You can point `TELNYX_VOICE_STREAM_URL` at any WebSocket server. The adapter's
+built-in `/ws/telnyx/voice/stream` endpoint is available if you want the Hermes
+host to receive the frames directly. Both options work — the adapter only needs
+to call `streaming_start` with the correct URL.
 
 ## Environment variables
 
@@ -209,6 +289,12 @@ failure.
 | `TELNYX_VOICE_GREETING` | unset | Optional greeting spoken after inbound calls are answered |
 | `TELNYX_VOICE_DEFAULT_VOICE` | `Telnyx.NaturalHD.astra` | Telnyx TTS voice for Call Control speak actions |
 | `TELNYX_VOICE_LANGUAGE` | `en-US` | Language for Call Control speak actions |
+| `TELNYX_VOICE_STREAM_URL` | unset | WebSocket URL for media streaming (e.g. `wss://example.com/ws`). When set, streaming auto-starts on call.answered. |
+| `TELNYX_VOICE_STREAM_TRACK` | `inbound_track` | Audio track to stream: `inbound_track`, `outbound_track`, `both_tracks` |
+| `TELNYX_VOICE_STREAM_CODEC` | `PCMU` | Audio codec for streaming: `PCMU`, `PCMA`, `G722`, `OPUS`, `AMR-WB`, `L16`, `default` |
+| `TELNYX_VOICE_WS_HOST` | same as webhook host | WebSocket server bind host |
+| `TELNYX_VOICE_WS_PORT` | same as webhook port | WebSocket server listen port |
+| `TELNYX_VOICE_WS_PATH` | `/ws/telnyx/voice/stream` | WebSocket endpoint path for Telnyx media frames |
 
 ## Runtime behavior
 

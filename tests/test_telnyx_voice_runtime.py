@@ -630,6 +630,360 @@ def test_extract_transcript_no_transcription_data():
 
 
 # ---------------------------------------------------------------------------
+# Media streaming
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streaming_start_posts_streaming_start_action(monkeypatch):
+    """streaming_start() POSTs to /calls/{id}/actions/streaming_start with the configured stream URL."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    monkeypatch.setenv("TELNYX_VOICE_STREAM_URL", "wss://example.com/ws")
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    result = await voice.streaming_start("cc-123")
+
+    assert result.success is True
+    assert len(fake.posts) == 1
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-123/actions/streaming_start"
+    assert fake.posts[0]["json"]["stream_url"] == "wss://example.com/ws"
+    assert fake.posts[0]["json"]["stream_track"] == "inbound_track"
+    assert fake.posts[0]["json"]["stream_codec"] == "PCMU"
+    assert fake.posts[0]["json"]["command_id"].startswith("hermes-stream-start-")
+
+
+@pytest.mark.asyncio
+async def test_streaming_start_with_bidirectional_options(monkeypatch):
+    """streaming_start() includes bidirectional params when provided."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    result = await voice.streaming_start(
+        "cc-123",
+        stream_url="wss://example.com/ws",
+        stream_track="both_tracks",
+        stream_codec="G722",
+        bidirectional_mode="rtp",
+        bidirectional_codec="G722",
+        bidirectional_sampling_rate=16000,
+        bidirectional_target_legs="both",
+    )
+
+    assert result.success is True
+    payload = fake.posts[0]["json"]
+    assert payload["stream_url"] == "wss://example.com/ws"
+    assert payload["stream_track"] == "both_tracks"
+    assert payload["stream_codec"] == "G722"
+    assert payload["stream_bidirectional_mode"] == "rtp"
+    assert payload["stream_bidirectional_codec"] == "G722"
+    assert payload["stream_bidirectional_sampling_rate"] == 16000
+    assert payload["stream_bidirectional_target_legs"] == "both"
+
+
+@pytest.mark.asyncio
+async def test_streaming_start_rejects_without_stream_url(monkeypatch):
+    """streaming_start() fails when no stream_url is configured."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    # No TELNYX_VOICE_STREAM_URL set
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    result = await voice.streaming_start("cc-123")
+
+    assert result.success is False
+    assert "No stream_url configured" in result.error
+    assert len(fake.posts) == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_stop_posts_streaming_stop_action(monkeypatch):
+    """streaming_stop() POSTs to /calls/{id}/actions/streaming_stop."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._active_streams["cc-123"] = "stream-abc"
+
+    result = await voice.streaming_stop("cc-123", stream_id="stream-abc")
+
+    assert result.success is True
+    assert len(fake.posts) == 1
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-123/actions/streaming_stop"
+    assert fake.posts[0]["json"]["stream_id"] == "stream-abc"
+    assert fake.posts[0]["json"]["command_id"].startswith("hermes-stream-stop-")
+    # active_streams should be cleaned up
+    assert "cc-123" not in voice._active_streams
+
+
+@pytest.mark.asyncio
+async def test_streaming_stop_without_stream_id(monkeypatch):
+    """streaming_stop() works without stream_id (stops all streams for the call)."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._active_streams["cc-123"] = "stream-xyz"
+
+    result = await voice.streaming_stop("cc-123")
+
+    assert result.success is True
+    assert "stream_id" not in fake.posts[0]["json"]
+    assert "cc-123" not in voice._active_streams
+
+
+@pytest.mark.asyncio
+async def test_call_answered_auto_starts_streaming(monkeypatch):
+    """When TELNYX_VOICE_STREAM_URL is set, streaming_start is called on call.answered."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    monkeypatch.setenv("TELNYX_VOICE_STREAM_URL", "wss://example.com/ws")
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._greeting = None
+
+    voice._active_calls["cc-ans-2"] = adapter.CallSession(
+        call_control_id="cc-ans-2",
+        call_session_id="sess-2",
+        client_state="cs-2",
+        caller_number="+15550000001",
+        dialed_number="+15550000002",
+        direction="outbound",
+        state="initiated",
+        started_at=0,
+    )
+
+    captured = []
+    async def fake_handle(event):
+        captured.append(event)
+    voice.handle_message = fake_handle
+
+    payload = {
+        "data": {
+            "event_type": "call.answered",
+            "payload": {
+                "id": "evt-ans-2",
+                "call_control_id": "cc-ans-2",
+                "direction": "outgoing",
+                "from": "+15550000001",
+                "to": "+15550000002",
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    assert response.status == 200
+
+    await __import__("asyncio").sleep(0.05)
+
+    # Should have made a streaming_start POST
+    stream_posts = [p for p in fake.posts if "/actions/streaming_start" in p["url"]]
+    assert len(stream_posts) == 1
+    assert stream_posts[0]["json"]["stream_url"] == "wss://example.com/ws"
+
+
+@pytest.mark.asyncio
+async def test_call_hangup_stops_streaming_and_closes_ws(monkeypatch):
+    """On hangup, active streams are stopped and WebSocket connections closed."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    monkeypatch.setenv("TELNYX_VOICE_STREAM_URL", "wss://example.com/ws")
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    voice._active_calls["cc-hup-2"] = adapter.CallSession(
+        call_control_id="cc-hup-2",
+        call_session_id="sess-hup-2",
+        client_state="cs-hup-2",
+        caller_number="+15550000001",
+        dialed_number="+15550000002",
+        direction="outbound",
+        state="answered",
+        started_at=0,
+    )
+    voice._active_streams["cc-hup-2"] = "stream-456"
+    # Simulate a mock WebSocket
+    mock_ws = AsyncMock()
+    voice._ws_connections["stream-456"] = mock_ws
+
+    captured = []
+    async def fake_handle(event):
+        captured.append(event)
+    voice.handle_message = fake_handle
+
+    payload = {
+        "data": {
+            "event_type": "call.hangup",
+            "payload": {
+                "id": "evt-hup-2",
+                "call_control_id": "cc-hup-2",
+                "direction": "outgoing",
+                "from": "+15550000001",
+                "to": "+15550000002",
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    assert response.status == 200
+
+    # streaming_stop should have been called
+    stop_posts = [p for p in fake.posts if "/actions/streaming_stop" in p["url"]]
+    assert len(stop_posts) == 1
+    assert stop_posts[0]["json"]["stream_id"] == "stream-456"
+    # WebSocket should have been closed
+    mock_ws.close.assert_called_once()
+    # Active streams should be cleaned up
+    assert "cc-hup-2" not in voice._active_streams
+
+
+@pytest.mark.asyncio
+async def test_streaming_started_webhook_records_stream_id(monkeypatch):
+    """streaming.started webhook records the stream_id in active_streams."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    voice._active_calls["cc-stream-1"] = adapter.CallSession(
+        call_control_id="cc-stream-1",
+        call_session_id="sess-stream",
+        client_state="cs-stream",
+        caller_number="+15550000001",
+        dialed_number="+15550000002",
+        direction="outbound",
+        state="answered",
+        started_at=0,
+    )
+
+    payload = {
+        "data": {
+            "event_type": "streaming.started",
+            "payload": {
+                "id": "evt-stream-1",
+                "call_control_id": "cc-stream-1",
+                "stream_id": "stream-789",
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    assert response.status == 200
+    assert voice._active_streams["cc-stream-1"] == "stream-789"
+
+
+@pytest.mark.asyncio
+async def test_streaming_stopped_webhook_cleans_up(monkeypatch):
+    """streaming.stopped webhook cleans up active_streams and closes ws."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    voice._active_calls["cc-stream-2"] = adapter.CallSession(
+        call_control_id="cc-stream-2",
+        call_session_id="sess-stream-2",
+        client_state="cs-stream-2",
+        caller_number="+15550000001",
+        dialed_number="+15550000002",
+        direction="outbound",
+        state="answered",
+        started_at=0,
+    )
+    voice._active_streams["cc-stream-2"] = "stream-old"
+    mock_ws = AsyncMock()
+    voice._ws_connections["stream-old"] = mock_ws
+
+    payload = {
+        "data": {
+            "event_type": "streaming.stopped",
+            "payload": {
+                "id": "evt-stream-2",
+                "call_control_id": "cc-stream-2",
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    assert response.status == 200
+    assert "cc-stream-2" not in voice._active_streams
+    mock_ws.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_stops_active_streams(monkeypatch):
+    """disconnect() stops all active media streams and closes WebSockets."""
+    monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    cfg = PlatformConfig(enabled=True, extra={})
+    voice = adapter.TelnyxVoiceCallAdapter(cfg)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._active_streams["cc-1"] = "s1"
+    voice._active_streams["cc-2"] = "s2"
+    mock_ws1 = AsyncMock()
+    mock_ws2 = AsyncMock()
+    voice._ws_connections["s1"] = mock_ws1
+    voice._ws_connections["s2"] = mock_ws2
+    # Simulate a connected runner
+    from unittest.mock import MagicMock
+    voice._runner = MagicMock()
+    voice._runner.cleanup = AsyncMock()
+
+    await voice.disconnect()
+
+    # streaming_stop should have been called for both calls
+    stop_posts = [p for p in fake.posts if "/actions/streaming_stop" in p["url"]]
+    assert len(stop_posts) == 2
+    # WebSocket connections should be closed
+    mock_ws1.close.assert_called_once()
+    mock_ws2.close.assert_called_once()
+    # Internal state should be clean
+    assert len(voice._active_streams) == 0
+    assert len(voice._ws_connections) == 0
+
+
+# ---------------------------------------------------------------------------
 # Auto-provisioning
 # ---------------------------------------------------------------------------
 

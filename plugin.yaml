@@ -83,3 +83,27 @@ optional_env:
     description: "Webhook signature timestamp tolerance in seconds (default: 300; 0 disables freshness check)"
     prompt: "Signature tolerance seconds"
     password: false
+  - name: TELNYX_VOICE_STREAM_URL
+    description: "WebSocket URL for Telnyx media streaming (e.g. wss://example.com/ws). When set, streaming_start is called automatically on call.answered."
+    prompt: "Media stream WebSocket URL"
+    password: false
+  - name: TELNYX_VOICE_STREAM_TRACK
+    description: "Which audio track to stream: inbound_track, outbound_track, or both_tracks (default: inbound_track)"
+    prompt: "Stream track"
+    password: false
+  - name: TELNYX_VOICE_STREAM_CODEC
+    description: "Audio codec for streaming: PCMU, PCMA, G722, OPUS, AMR-WB, L16, or default (default: PCMU)"
+    prompt: "Stream codec"
+    password: false
+  - name: TELNYX_VOICE_WS_HOST
+    description: "WebSocket server bind host (default: same as webhook host)"
+    prompt: "WebSocket host"
+    password: false
+  - name: TELNYX_VOICE_WS_PORT
+    description: "WebSocket server listen port (default: same as webhook port)"
+    prompt: "WebSocket port"
+    password: false
+  - name: TELNYX_VOICE_WS_PATH
+    description: "WebSocket server path for Telnyx media frames (default: /ws/telnyx/voice/stream)"
+    prompt: "WebSocket path"
+    password: false
