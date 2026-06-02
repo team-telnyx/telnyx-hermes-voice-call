@@ -126,3 +126,5 @@ def test_adapter_has_call_control_actions():
     assert "async def start_recording(" in source
     assert "async def stop_recording(" in source
     assert "async def transfer_call(" in source
+    assert "async def transcription_start(" in source
+    assert "async def transcription_stop(" in source

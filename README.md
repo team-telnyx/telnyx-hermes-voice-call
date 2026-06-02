@@ -31,6 +31,7 @@ and webhook behavior with the finalized OpenClaw voice-call plugin.
 - Registers Hermes platform `telnyx_voice_call`
 - Starts an `aiohttp` webhook server for Telnyx Call Control events
 - Answers inbound calls and optionally speaks a greeting
+- **Starts speech transcription on answer so the agent can hear the caller** (two-way conversation)
 - Sends Hermes replies into active calls via `speak`
 - Creates outbound calls for E.164 targets
 - Handles `call.initiated`, `call.answered`, `call.transcription`,
@@ -39,7 +40,7 @@ and webhook behavior with the finalized OpenClaw voice-call plugin.
   events
 - Supports Telnyx Ed25519 webhook signature verification with replay protection
 - **Call control actions:** hangup, conference, recording (start/stop), transfer,
-  streaming (start/stop)
+  streaming (start/stop), transcription (start/stop)
 - **Media streaming:** real-time bidirectional audio over WebSockets via Telnyx
   Call Control `streaming_start`/`streaming_stop`, with a built-in WebSocket
   endpoint for receiving media frames
@@ -178,9 +179,25 @@ The adapter exposes call control methods that can be invoked programmatically:
 | `transfer_call(call_control_id, to)` | `POST /calls/{id}/actions/transfer` | Transfer a call to another destination |
 | `streaming_start(call_control_id, **)` | `POST /calls/{id}/actions/streaming_start` | Start media streaming to a WebSocket |
 | `streaming_stop(call_control_id, **)` | `POST /calls/{id}/actions/streaming_stop` | Stop media streaming |
+| `transcription_start(call_control_id, **)` | `POST /calls/{id}/actions/transcription_start` | Start real-time speech-to-text |
+| `transcription_stop(call_control_id)` | `POST /calls/{id}/actions/transcription_stop` | Stop real-time speech-to-text |
 
 All methods return `SendResult` with `success=True/False` and error details on
 failure.
+
+### Hearing the caller (transcription)
+
+For a two-way conversation the agent must *hear* the caller, not just speak.
+The adapter automatically calls `transcription_start` when a call is answered
+(both inbound and outbound), which makes Telnyx emit `call.transcription`
+webhooks. Each final transcript is forwarded to Hermes as the caller's message,
+and the agent's reply is spoken back via `speak`. Transcription is stopped on
+hangup.
+
+This is enabled by default. To disable it (e.g. when using a custom media
+streaming / ASR pipeline instead), set `TELNYX_VOICE_TRANSCRIPTION=false`.
+The engine (`TELNYX_VOICE_TRANSCRIPTION_ENGINE`, default `A`) and language
+(`TELNYX_VOICE_TRANSCRIPTION_LANGUAGE`, default `en-US`) are configurable.
 
 ## Media streaming
 
