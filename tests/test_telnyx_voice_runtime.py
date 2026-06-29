@@ -254,7 +254,7 @@ async def test_transfer_call_posts_transfer_action(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_inbound_call_answers_and_emits_message(monkeypatch):
+async def test_handle_inbound_call_answers_starts_transcription_and_greets(monkeypatch):
     voice = make_adapter(monkeypatch)
     fake = FakeSession()
     voice._http_session = fake
@@ -292,11 +292,9 @@ async def test_handle_inbound_call_answers_and_emits_message(monkeypatch):
     assert post_urls[0] == "https://api.telnyx.com/v2/calls/cc-in-123/actions/answer"
     assert "https://api.telnyx.com/v2/calls/cc-in-123/actions/transcription_start" in post_urls
     assert "https://api.telnyx.com/v2/calls/cc-in-123/actions/speak" in post_urls
-    assert len(captured) == 1
-    event = captured[0]
-    assert event.message_id == "cc-in-123"
-    assert event.source.chat_id == "call_control:cc-in-123"
-    assert "Incoming Telnyx voice call" in event.text
+    # Lifecycle events should not consume the Hermes chat session. Only caller
+    # utterances should become user turns that the agent answers.
+    assert captured == []
 
 
 def test_signature_required_without_public_key_is_invalid(monkeypatch):
@@ -630,6 +628,60 @@ def test_extract_transcript_no_transcription_data():
     voice = adapter.TelnyxVoiceCallAdapter(PlatformConfig(enabled=True, extra={}))
     result = voice._extract_transcript({"transcription": "fallback text"})
     assert result == "fallback text"
+
+
+@pytest.mark.asyncio
+async def test_transcription_webhook_emits_clean_caller_message(monkeypatch):
+    """Final transcription should reach Hermes as caller speech, not lifecycle boilerplate."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._active_calls["cc-transcript-1"] = adapter.CallSession(
+        call_control_id="cc-transcript-1",
+        call_session_id="sess-transcript",
+        caller_number="+15550000002",
+        dialed_number="+15550000001",
+        direction="inbound",
+        state="answered",
+        started_at=0,
+    )
+    captured = []
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    voice.handle_message = fake_handle
+
+    payload = {
+        "data": {
+            "id": "evt-transcript-1",
+            "event_type": "call.transcription",
+            "payload": {
+                "id": "payload-transcript-1",
+                "call_control_id": "cc-transcript-1",
+                "direction": "incoming",
+                "from": "+15550000002",
+                "to": "+15550000001",
+                "transcription_data": {
+                    "transcript": "Can you hear me?",
+                    "is_final": True,
+                },
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0.05)
+
+    assert response.status == 200
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.text == "Can you hear me?"
+    assert event.source.chat_id == "call_control:cc-transcript-1"
+    assert event.message_id == "evt-transcript-1"
+    assert "Reply with the message" not in event.text
 
 
 # ---------------------------------------------------------------------------

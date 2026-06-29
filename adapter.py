@@ -707,7 +707,6 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                         logger.warning("[telnyx_voice_call] inbound transcription_start failed for %s: %s", call_control_id, tr.error)
                 if self._greeting:
                     await self._speak(call_control_id, self._greeting)
-                await self._emit_call_event(payload, session, call_control_id, "Incoming Telnyx voice call")
 
             task = asyncio.ensure_future(_handle_initiated())
             self._background_tasks.add(task)
@@ -736,7 +735,6 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 if queued_text:
                     logger.info("[telnyx_voice_call] delivering queued speak for %s", call_control_id)
                     await self._speak(call_control_id, queued_text)
-                await self._emit_call_event(payload, session, call_control_id, "Telnyx voice call answered")
 
             task = asyncio.ensure_future(_handle_answered())
             self._background_tasks.add(task)
@@ -744,11 +742,11 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         elif event_type == "call.transcription":
             transcript = self._extract_transcript(event_payload)
             if transcript:
-                await self._emit_call_event(payload, session, call_control_id, transcript)
+                await self._emit_caller_message(payload, session, call_control_id, transcript)
         elif event_type == "call.dtmf.received":
             digit = str(event_payload.get("digit") or "").strip()
             if digit:
-                await self._emit_call_event(payload, session, call_control_id, f"Caller pressed {digit}")
+                await self._emit_caller_message(payload, session, call_control_id, f"Caller pressed {digit}.")
         elif event_type == "call.hangup":
             session.state = "ended"
             self._pending_speak.pop(call_control_id, None)
@@ -772,7 +770,6 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                     await ws.close()
                 except Exception:
                     pass
-            await self._emit_call_event(payload, session, call_control_id, "Call ended")
             self._active_calls.pop(call_control_id, None)
             logger.info("[telnyx_voice_call] call ended for %s", call_control_id)
         elif event_type == "call.conference.created":
@@ -843,10 +840,13 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 return str(transcript).strip()
         return str(event_payload.get("transcription") or "").strip()
 
-    async def _emit_call_event(self, raw: dict[str, Any], session: CallSession, call_control_id: str, prefix: str) -> None:
+    async def _emit_caller_message(self, raw: dict[str, Any], session: CallSession, call_control_id: str, text: str) -> None:
+        message_text = str(text or "").strip()
+        if not message_text:
+            return
         caller = session.caller_number or "unknown caller"
-        dialed = session.dialed_number or self._from_number or "unknown destination"
-        text = f"{prefix} from {caller} to {dialed}. Reply with the message to speak to the caller."
+        data = raw.get("data") if isinstance(raw, dict) else {}
+        event_id = str((data or {}).get("id") or f"{call_control_id}:{time.time_ns()}")
         source = SessionSource(
             platform=Platform("telnyx_voice_call"),
             chat_id=_call_control_chat_id(call_control_id),
@@ -854,14 +854,14 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=session.caller_number or call_control_id,
             user_name=caller,
-            message_id=call_control_id,
+            message_id=event_id,
         )
         event = MessageEvent(
-            text=text,
+            text=message_text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=raw,
-            message_id=call_control_id,
+            message_id=event_id,
         )
         task = asyncio.ensure_future(self._safe_handle_message(event))
         self._background_tasks.add(task)
