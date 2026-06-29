@@ -83,6 +83,18 @@ optional_env:
     description: "Webhook signature timestamp tolerance in seconds (default: 300; 0 disables freshness check)"
     prompt: "Signature tolerance seconds"
     password: false
+  - name: TELNYX_VOICE_TRANSCRIPTION
+    description: "Enable real-time speech transcription so the agent can hear the caller (default: true). Required for two-way conversation."
+    prompt: "Enable transcription? (true/false)"
+    password: false
+  - name: TELNYX_VOICE_TRANSCRIPTION_ENGINE
+    description: "Telnyx transcription engine: A (Google) or B (Telnyx) (default: A)"
+    prompt: "Transcription engine"
+    password: false
+  - name: TELNYX_VOICE_TRANSCRIPTION_LANGUAGE
+    description: "Language for speech transcription (default: en-US / matches TELNYX_VOICE_LANGUAGE)"
+    prompt: "Transcription language"
+    password: false
   - name: TELNYX_VOICE_STREAM_URL
     description: "WebSocket URL for Telnyx media streaming (e.g. wss://example.com/ws). When set, streaming_start is called automatically on call.answered."
     prompt: "Media stream WebSocket URL"

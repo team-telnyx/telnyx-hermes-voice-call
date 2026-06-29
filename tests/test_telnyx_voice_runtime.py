@@ -254,7 +254,7 @@ async def test_transfer_call_posts_transfer_action(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_inbound_call_answers_and_emits_message(monkeypatch):
+async def test_handle_inbound_call_answers_starts_transcription_and_greets(monkeypatch):
     voice = make_adapter(monkeypatch)
     fake = FakeSession()
     voice._http_session = fake
@@ -287,13 +287,14 @@ async def test_handle_inbound_call_answers_and_emits_message(monkeypatch):
     # Give background tasks time to complete
     await __import__("asyncio").sleep(0.05)
 
-    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-in-123/actions/answer"
-    assert fake.posts[1]["url"] == "https://api.telnyx.com/v2/calls/cc-in-123/actions/speak"
-    assert len(captured) == 1
-    event = captured[0]
-    assert event.message_id == "cc-in-123"
-    assert event.source.chat_id == "call_control:cc-in-123"
-    assert "Incoming Telnyx voice call" in event.text
+    # Inbound flow: answer -> start transcription (so the bot can hear) -> greet
+    post_urls = [p["url"] for p in fake.posts]
+    assert post_urls[0] == "https://api.telnyx.com/v2/calls/cc-in-123/actions/answer"
+    assert "https://api.telnyx.com/v2/calls/cc-in-123/actions/transcription_start" in post_urls
+    assert "https://api.telnyx.com/v2/calls/cc-in-123/actions/speak" in post_urls
+    # Lifecycle events should not consume the Hermes chat session. Only caller
+    # utterances should become user turns that the agent answers.
+    assert captured == []
 
 
 def test_signature_required_without_public_key_is_invalid(monkeypatch):
@@ -627,6 +628,60 @@ def test_extract_transcript_no_transcription_data():
     voice = adapter.TelnyxVoiceCallAdapter(PlatformConfig(enabled=True, extra={}))
     result = voice._extract_transcript({"transcription": "fallback text"})
     assert result == "fallback text"
+
+
+@pytest.mark.asyncio
+async def test_transcription_webhook_emits_clean_caller_message(monkeypatch):
+    """Final transcription should reach Hermes as caller speech, not lifecycle boilerplate."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._active_calls["cc-transcript-1"] = adapter.CallSession(
+        call_control_id="cc-transcript-1",
+        call_session_id="sess-transcript",
+        caller_number="+15550000002",
+        dialed_number="+15550000001",
+        direction="inbound",
+        state="answered",
+        started_at=0,
+    )
+    captured = []
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    voice.handle_message = fake_handle
+
+    payload = {
+        "data": {
+            "id": "evt-transcript-1",
+            "event_type": "call.transcription",
+            "payload": {
+                "id": "payload-transcript-1",
+                "call_control_id": "cc-transcript-1",
+                "direction": "incoming",
+                "from": "+15550000002",
+                "to": "+15550000001",
+                "transcription_data": {
+                    "transcript": "Can you hear me?",
+                    "is_final": True,
+                },
+            },
+        }
+    }
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0.05)
+
+    assert response.status == 200
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.text == "Can you hear me?"
+    assert event.source.chat_id == "call_control:cc-transcript-1"
+    assert event.message_id == "evt-transcript-1"
+    assert "Reply with the message" not in event.text
 
 
 # ---------------------------------------------------------------------------
@@ -1055,3 +1110,159 @@ async def test_provision_loads_persisted_state(tmp_path, monkeypatch):
     )
     assert result.connection_id == "conn-persisted"
     assert result.from_number == "+15550008888"
+
+
+# ---------------------------------------------------------------------------
+# Transcription (speech-to-text) — so the bot can hear the caller
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transcription_start_posts_action(monkeypatch):
+    """transcription_start() POSTs to /actions/transcription_start with engine + language."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+
+    result = await voice.transcription_start("cc-123")
+
+    assert result.success is True
+    assert len(fake.posts) == 1
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-123/actions/transcription_start"
+    assert fake.posts[0]["json"]["transcription_engine"] == adapter.DEFAULT_TRANSCRIPTION_ENGINE
+    assert fake.posts[0]["json"]["language"] == "en-US"
+    assert fake.posts[0]["json"]["command_id"].startswith("hermes-transcription-start-")
+    assert "cc-123" in voice._active_transcriptions
+
+
+@pytest.mark.asyncio
+async def test_transcription_stop_posts_action(monkeypatch):
+    """transcription_stop() POSTs to /actions/transcription_stop and clears tracking."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._active_transcriptions.add("cc-123")
+
+    result = await voice.transcription_stop("cc-123")
+
+    assert result.success is True
+    assert fake.posts[0]["url"] == "https://api.telnyx.com/v2/calls/cc-123/actions/transcription_stop"
+    assert "cc-123" not in voice._active_transcriptions
+
+
+@pytest.mark.asyncio
+async def test_call_answered_auto_starts_transcription(monkeypatch):
+    """On call.answered, transcription is started so the agent can hear the caller."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._greeting = None
+
+    voice._active_calls["cc-ans-tr"] = adapter.CallSession(
+        call_control_id="cc-ans-tr",
+        direction="outbound",
+        state="initiated",
+        started_at=0,
+    )
+
+    async def fake_handle(event):
+        pass
+    voice.handle_message = fake_handle
+
+    payload = {"data": {"event_type": "call.answered",
+        "payload": {"id": "evt", "call_control_id": "cc-ans-tr", "direction": "outgoing"}}}
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    assert response.status == 200
+    await __import__("asyncio").sleep(0.05)
+
+    tr_posts = [p for p in fake.posts if "/actions/transcription_start" in p["url"]]
+    assert len(tr_posts) == 1
+    assert "cc-ans-tr" in voice._active_transcriptions
+
+
+@pytest.mark.asyncio
+async def test_inbound_call_starts_transcription(monkeypatch):
+    """Inbound call.initiated answers AND starts transcription (two-way conversation)."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._greeting = None
+
+    async def fake_handle(event):
+        pass
+    voice.handle_message = fake_handle
+
+    payload = {"data": {"event_type": "call.initiated",
+        "payload": {"id": "evt", "call_control_id": "cc-in-tr", "direction": "incoming",
+                    "from": "+14155550000", "to": "+15550000001"}}}
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    response = await voice._handle_webhook(request)
+    assert response.status == 200
+    await __import__("asyncio").sleep(0.05)
+
+    answer_posts = [p for p in fake.posts if "/actions/answer" in p["url"]]
+    tr_posts = [p for p in fake.posts if "/actions/transcription_start" in p["url"]]
+    assert len(answer_posts) == 1
+    assert len(tr_posts) == 1
+    assert "cc-in-tr" in voice._active_transcriptions
+
+
+@pytest.mark.asyncio
+async def test_transcription_can_be_disabled(monkeypatch):
+    """Setting TELNYX_VOICE_TRANSCRIPTION=false suppresses auto-start on answer."""
+    monkeypatch.setenv("TELNYX_VOICE_TRANSCRIPTION", "false")
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._greeting = None
+    assert voice._transcription_enabled is False
+
+    voice._active_calls["cc-off"] = adapter.CallSession(
+        call_control_id="cc-off", direction="outbound", state="initiated", started_at=0)
+
+    async def fake_handle(event):
+        pass
+    voice.handle_message = fake_handle
+
+    payload = {"data": {"event_type": "call.answered",
+        "payload": {"id": "evt", "call_control_id": "cc-off", "direction": "outgoing"}}}
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0.05)
+
+    tr_posts = [p for p in fake.posts if "/actions/transcription_start" in p["url"]]
+    assert len(tr_posts) == 0
+
+
+@pytest.mark.asyncio
+async def test_call_hangup_stops_transcription(monkeypatch):
+    """On hangup, an active transcription is stopped."""
+    voice = make_adapter(monkeypatch)
+    fake = FakeSession()
+    voice._http_session = fake
+    voice._active_transcriptions.add("cc-hang-tr")
+    voice._active_calls["cc-hang-tr"] = adapter.CallSession(
+        call_control_id="cc-hang-tr", direction="inbound", state="answered", started_at=0)
+
+    async def fake_handle(event):
+        pass
+    voice.handle_message = fake_handle
+
+    payload = {"data": {"event_type": "call.hangup",
+        "payload": {"id": "evt", "call_control_id": "cc-hang-tr"}}}
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = json.dumps(payload).encode()
+
+    await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0.05)
+
+    tr_stop_posts = [p for p in fake.posts if "/actions/transcription_stop" in p["url"]]
+    assert len(tr_stop_posts) == 1
+    assert "cc-hang-tr" not in voice._active_transcriptions

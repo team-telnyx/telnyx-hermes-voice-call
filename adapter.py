@@ -40,6 +40,8 @@ DEFAULT_VOICE = "Telnyx.NaturalHD.astra"
 DEFAULT_LANGUAGE = "en-US"
 DEFAULT_STREAM_TRACK = "inbound_track"
 DEFAULT_STREAM_CODEC = "PCMU"
+DEFAULT_TRANSCRIPTION_ENGINE = "A"
+DEFAULT_TRANSCRIPTION_LANGUAGE = "en-US"
 MAX_SPEAK_LENGTH = 5000
 WEBHOOK_BODY_MAX_BYTES = 1_048_576
 E164_RE = re.compile(r"^\+[1-9]\d{1,14}$")
@@ -239,6 +241,14 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         except ValueError:
             self._ws_port = self._webhook_port
         self._ws_path = _env("TELNYX_VOICE_WS_PATH") or str(extra.get("ws_path", DEFAULT_WS_PATH))
+        # Speech-to-text (so the bot can hear the caller). Enabled by default;
+        # without it Telnyx never emits call.transcription events and the agent
+        # can speak but never receives what the caller says.
+        _transcription_raw = _env("TELNYX_VOICE_TRANSCRIPTION") or str(extra.get("transcription", ""))
+        self._transcription_enabled = _truthy(_transcription_raw) if _transcription_raw else True
+        self._transcription_engine = _env("TELNYX_VOICE_TRANSCRIPTION_ENGINE") or str(extra.get("transcription_engine", DEFAULT_TRANSCRIPTION_ENGINE))
+        self._transcription_language = _env("TELNYX_VOICE_TRANSCRIPTION_LANGUAGE") or str(extra.get("transcription_language", self._language or DEFAULT_TRANSCRIPTION_LANGUAGE))
+        self._active_transcriptions: set[str] = set()  # call_control_ids with transcription running
         self._active_calls: dict[str, CallSession] = {}
         self._pending_speak: dict[str, str] = {}  # call_control_id → queued text
         self._active_streams: dict[str, str] = {}  # call_control_id → stream_id
@@ -580,6 +590,48 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         self._active_streams.pop(call_control_id, None)
         return SendResult(success=True, message_id=call_control_id, raw_response=response)
 
+    # ------------------------------------------------------------------
+    # Speech-to-text (transcription) actions
+    # ------------------------------------------------------------------
+
+    async def transcription_start(
+        self,
+        call_control_id: str,
+        *,
+        engine: Optional[str] = None,
+        language: Optional[str] = None,
+    ) -> SendResult:
+        """Start real-time speech transcription on a call.
+
+        Without this, Telnyx never emits ``call.transcription`` webhooks, so
+        the agent can speak but never receives what the caller says. Called
+        automatically on ``call.answered`` when transcription is enabled.
+        """
+        if not call_control_id:
+            return SendResult(success=False, error="Missing call_control_id")
+        payload = {
+            "command_id": f"hermes-transcription-start-{uuid.uuid4()}",
+            "transcription_engine": engine or self._transcription_engine,
+            "language": language or self._transcription_language,
+            "interim_results": False,
+        }
+        response = await self._post_json(f"/calls/{call_control_id}/actions/transcription_start", payload)
+        if response.get("error"):
+            return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
+        self._active_transcriptions.add(call_control_id)
+        return SendResult(success=True, message_id=call_control_id, raw_response=response)
+
+    async def transcription_stop(self, call_control_id: str) -> SendResult:
+        """Stop real-time speech transcription on a call."""
+        payload = {
+            "command_id": f"hermes-transcription-stop-{uuid.uuid4()}",
+        }
+        response = await self._post_json(f"/calls/{call_control_id}/actions/transcription_stop", payload)
+        self._active_transcriptions.discard(call_control_id)
+        if response.get("error"):
+            return SendResult(success=False, error=response["error"], raw_response=response, retryable=response.get("retryable", False))
+        return SendResult(success=True, message_id=call_control_id, raw_response=response)
+
     async def _answer(self, call_control_id: str) -> SendResult:
         response = await self._post_json(
             f"/calls/{call_control_id}/actions/answer",
@@ -642,9 +694,19 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             # enough, which would cause double-answer.
             async def _handle_initiated():
                 await self._answer(call_control_id)
+                # Start transcription so the agent can hear the caller. Done
+                # here (right after answering) rather than waiting only on the
+                # call.answered webhook, so inbound conversation works even if
+                # that event is delayed. The _active_transcriptions guard in
+                # call.answered prevents a duplicate start.
+                if self._transcription_enabled and call_control_id not in self._active_transcriptions:
+                    tr = await self.transcription_start(call_control_id)
+                    if tr.success:
+                        logger.info("[telnyx_voice_call] transcription started for inbound %s", call_control_id)
+                    else:
+                        logger.warning("[telnyx_voice_call] inbound transcription_start failed for %s: %s", call_control_id, tr.error)
                 if self._greeting:
                     await self._speak(call_control_id, self._greeting)
-                await self._emit_call_event(payload, session, call_control_id, "Incoming Telnyx voice call")
 
             task = asyncio.ensure_future(_handle_initiated())
             self._background_tasks.add(task)
@@ -654,6 +716,14 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             # Process answered in the background too (speak + stream + emit
             # can be slow) and ack the webhook immediately.
             async def _handle_answered():
+                # Start speech transcription so the agent can hear the caller.
+                # Without this Telnyx never emits call.transcription events.
+                if self._transcription_enabled and call_control_id not in self._active_transcriptions:
+                    tr = await self.transcription_start(call_control_id)
+                    if tr.success:
+                        logger.info("[telnyx_voice_call] transcription started for %s", call_control_id)
+                    else:
+                        logger.warning("[telnyx_voice_call] transcription_start failed for %s: %s", call_control_id, tr.error)
                 # Auto-start media streaming if a stream URL is configured.
                 if self._stream_url:
                     stream_result = await self.streaming_start(call_control_id)
@@ -665,7 +735,6 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 if queued_text:
                     logger.info("[telnyx_voice_call] delivering queued speak for %s", call_control_id)
                     await self._speak(call_control_id, queued_text)
-                await self._emit_call_event(payload, session, call_control_id, "Telnyx voice call answered")
 
             task = asyncio.ensure_future(_handle_answered())
             self._background_tasks.add(task)
@@ -673,14 +742,20 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         elif event_type == "call.transcription":
             transcript = self._extract_transcript(event_payload)
             if transcript:
-                await self._emit_call_event(payload, session, call_control_id, transcript)
+                await self._emit_caller_message(payload, session, call_control_id, transcript)
         elif event_type == "call.dtmf.received":
             digit = str(event_payload.get("digit") or "").strip()
             if digit:
-                await self._emit_call_event(payload, session, call_control_id, f"Caller pressed {digit}")
+                await self._emit_caller_message(payload, session, call_control_id, f"Caller pressed {digit}.")
         elif event_type == "call.hangup":
             session.state = "ended"
             self._pending_speak.pop(call_control_id, None)
+            # Stop transcription on hangup (best-effort cleanup).
+            if call_control_id in self._active_transcriptions:
+                try:
+                    await self.transcription_stop(call_control_id)
+                except Exception as exc:
+                    logger.warning("[telnyx_voice_call] transcription_stop on hangup failed for %s: %s", call_control_id, exc)
             # Stop any active media stream on hangup.
             stream_id = self._active_streams.pop(call_control_id, None)
             if stream_id or self._stream_url:
@@ -695,7 +770,6 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                     await ws.close()
                 except Exception:
                     pass
-            await self._emit_call_event(payload, session, call_control_id, "Call ended")
             self._active_calls.pop(call_control_id, None)
             logger.info("[telnyx_voice_call] call ended for %s", call_control_id)
         elif event_type == "call.conference.created":
@@ -766,10 +840,13 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                 return str(transcript).strip()
         return str(event_payload.get("transcription") or "").strip()
 
-    async def _emit_call_event(self, raw: dict[str, Any], session: CallSession, call_control_id: str, prefix: str) -> None:
+    async def _emit_caller_message(self, raw: dict[str, Any], session: CallSession, call_control_id: str, text: str) -> None:
+        message_text = str(text or "").strip()
+        if not message_text:
+            return
         caller = session.caller_number or "unknown caller"
-        dialed = session.dialed_number or self._from_number or "unknown destination"
-        text = f"{prefix} from {caller} to {dialed}. Reply with the message to speak to the caller."
+        data = raw.get("data") if isinstance(raw, dict) else {}
+        event_id = str((data or {}).get("id") or f"{call_control_id}:{time.time_ns()}")
         source = SessionSource(
             platform=Platform("telnyx_voice_call"),
             chat_id=_call_control_chat_id(call_control_id),
@@ -777,14 +854,14 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=session.caller_number or call_control_id,
             user_name=caller,
-            message_id=call_control_id,
+            message_id=event_id,
         )
         event = MessageEvent(
-            text=text,
+            text=message_text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=raw,
-            message_id=call_control_id,
+            message_id=event_id,
         )
         task = asyncio.ensure_future(self._safe_handle_message(event))
         self._background_tasks.add(task)
