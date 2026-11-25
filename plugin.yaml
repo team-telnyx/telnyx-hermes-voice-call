@@ -47,9 +47,9 @@ optional_env:
     description: "Telnyx account public key for Ed25519 webhook signature verification"
     prompt: "Telnyx public key"
     password: true
-  - name: TELNYX_VOICE_REQUIRE_SIGNATURE
-    description: "Require valid Telnyx webhook signatures (recommended in production)"
-    prompt: "Require webhook signature? (true/false)"
+  - name: TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION
+    description: "Local development only: accept webhooks without TELNYX_PUBLIC_KEY (no signature check). Ignored when a public key is set."
+    prompt: "Skip webhook signature verification? (true/false)"
     password: false
   - name: TELNYX_VOICE_ALLOWED_USERS
     description: "Comma-separated E.164 phone numbers allowed to call the bot"

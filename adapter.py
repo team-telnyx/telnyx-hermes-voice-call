@@ -27,7 +27,10 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import redact_phone, strip_markdown
 from gateway.session import SessionSource
 
-from provisioning import ProvisioningResult, deprovision, provision
+try:
+    from .provisioning import ProvisioningResult, deprovision, provision
+except ImportError:  # loaded as a flat module (repo tests, direct file load)
+    from provisioning import ProvisioningResult, deprovision, provision
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +225,9 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             self._webhook_port = DEFAULT_WEBHOOK_PORT
         self._webhook_path = _env("TELNYX_VOICE_WEBHOOK_PATH") or str(extra.get("webhook_path", DEFAULT_WEBHOOK_PATH))
         self._public_key = _env("TELNYX_PUBLIC_KEY") or str(extra.get("public_key", "")).strip()
-        self._require_signature = _truthy(_env("TELNYX_VOICE_REQUIRE_SIGNATURE") or str(extra.get("require_signature", "")))
+        # Webhook signatures are always verified. Running without a public key
+        # requires this explicit local-development opt-out.
+        self._insecure_skip_signature = _truthy(_env("TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION"))
         self._voice = _env("TELNYX_VOICE_DEFAULT_VOICE") or str(extra.get("voice", DEFAULT_VOICE))
         self._language = _env("TELNYX_VOICE_LANGUAGE") or str(extra.get("language", DEFAULT_LANGUAGE))
         self._greeting = _env("TELNYX_VOICE_GREETING") or str(extra.get("greeting", "")).strip()
@@ -258,7 +263,7 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         self._runner = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         import aiohttp
         from aiohttp import web
 
@@ -303,12 +308,27 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
             logger.error(msg)
             self._set_fatal_error("telnyx_voice_missing_connection_id", msg, retryable=False)
             return False
-        if self._require_signature and not self._public_key:
-            msg = "[telnyx_voice_call] signature verification required but TELNYX_PUBLIC_KEY is not set"
-            logger.error(msg)
-            self._set_fatal_error("telnyx_voice_missing_public_key", msg, retryable=False)
-            return False
-        if self._public_key or self._require_signature:
+        if not self._public_key:
+            if not self._insecure_skip_signature:
+                msg = (
+                    "[telnyx_voice_call] TELNYX_PUBLIC_KEY is not set, so incoming webhooks cannot be verified "
+                    "and will be rejected. Set TELNYX_PUBLIC_KEY (Mission Control > Public Key). For local "
+                    "development only, set TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION=true."
+                )
+                logger.error(msg)
+                self._set_fatal_error("telnyx_voice_missing_public_key", msg, retryable=False)
+                return False
+            logger.warning(
+                "[telnyx_voice_call] WARNING: TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION is set and no "
+                "TELNYX_PUBLIC_KEY is configured. Webhooks are accepted WITHOUT verification; anyone who can reach "
+                "the webhook port can forge calls. Local development only."
+            )
+        else:
+            if self._insecure_skip_signature:
+                logger.warning(
+                    "[telnyx_voice_call] TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION is ignored because "
+                    "TELNYX_PUBLIC_KEY is set; webhook signatures are still verified."
+                )
             try:
                 from nacl.signing import VerifyKey  # noqa: F401
             except ImportError:
@@ -986,13 +1006,14 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                         )
 
                     elif event == "dtmf":
-                        digit = str(frame.get("dtmf", {}).get("digit", ""))
+                        digit = str((frame.get("dtmf") or {}).get("digit") or "").strip()
                         logger.info("[telnyx_voice_call] ws: DTMF digit=%s stream=%s", digit, stream_id)
-                        # Emit as a Hermes message event if call_control_id is known
-                        if call_control_id:
+                        # Deliver as a caller message, the same way webhook call events are
+                        # delivered, once the call is known.
+                        if call_control_id and digit:
                             session = self._active_calls.get(call_control_id)
                             if session:
-                                await self._emit_call_event(
+                                await self._emit_caller_message(
                                     {"data": {"event_type": "call.dtmf.received", "payload": {"call_control_id": call_control_id}}},
                                     session,
                                     call_control_id,
@@ -1041,12 +1062,21 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         return ws
 
     def _validate_telnyx_signature(self, body: bytes, headers: Dict[str, str]) -> bool:
-        if not (self._public_key or self._require_signature):
-            return True
+        """Return True only for webhooks whose Ed25519 signature verifies.
+
+        Fails closed: without a public key nothing can be verified, so the
+        webhook is rejected unless the explicit local-development opt-out is set.
+        """
+        if not self._public_key:
+            if self._insecure_skip_signature:
+                logger.warning("[telnyx_voice_call] accepting unverified webhook (insecure opt-out is set)")
+                return True
+            logger.warning("[telnyx_voice_call] rejecting webhook: TELNYX_PUBLIC_KEY is not set, signature cannot be verified")
+            return False
 
         signature_raw = headers.get("Telnyx-Signature-Ed25519") or headers.get("telnyx-signature-ed25519")
         timestamp = headers.get("Telnyx-Timestamp") or headers.get("telnyx-timestamp")
-        if not signature_raw or not timestamp or not self._public_key:
+        if not signature_raw or not timestamp:
             return False
 
         try:

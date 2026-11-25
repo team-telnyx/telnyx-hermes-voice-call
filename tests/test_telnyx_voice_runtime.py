@@ -52,12 +52,58 @@ class FakeSession:
         self.closed = True
 
 
+@pytest.fixture(autouse=True)
+def _unsigned_webhooks_allowed_for_call_flow_tests(monkeypatch):
+    """Most tests here drive call flows with unsigned payloads and no public key.
+
+    Signature behaviour (fail-closed, bad and valid signatures) is covered by
+    the tests below, which use make_strict_adapter() and clear this opt-out.
+    """
+    monkeypatch.setenv("TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION", "true")
+
+
 def make_adapter(monkeypatch):
     monkeypatch.setenv("TELNYX_API_KEY", "KEY_test")
     monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
     monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
     cfg = PlatformConfig(enabled=True, extra={})
     return adapter.TelnyxVoiceCallAdapter(cfg)
+
+
+def make_strict_adapter(monkeypatch, public_key=""):
+    """Adapter with signature verification enabled (no opt-out)."""
+    monkeypatch.setenv("TELNYX_API_KEY", "test-api-token")
+    monkeypatch.setenv("TELNYX_VOICE_FROM_NUMBER", "+15550000001")
+    monkeypatch.setenv("TELNYX_CALL_CONTROL_CONNECTION_ID", "conn-123")
+    monkeypatch.delenv("TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION", raising=False)
+    monkeypatch.setenv("TELNYX_PUBLIC_KEY", public_key)
+    return adapter.TelnyxVoiceCallAdapter(PlatformConfig(enabled=True, extra={}))
+
+
+def _signed_headers(signing_key, body: bytes, timestamp: str | None = None) -> dict:
+    import base64
+    import time as _time
+
+    ts = timestamp or str(int(_time.time()))
+    signed = signing_key.sign(f"{ts}|".encode() + body)
+    return {
+        "Telnyx-Signature-Ed25519": base64.b64encode(signed.signature).decode(),
+        "Telnyx-Timestamp": ts,
+    }
+
+
+def _public_key_b64(signing_key) -> str:
+    import base64
+
+    return base64.b64encode(bytes(signing_key.verify_key)).decode()
+
+
+DTMF_PAYLOAD = {
+    "data": {
+        "event_type": "call.dtmf.received",
+        "payload": {"call_control_id": "cc-dtmf-1", "digit": "5"},
+    }
+}
 
 
 def test_validate_config_accepts_env_without_extra(monkeypatch):
@@ -297,11 +343,164 @@ async def test_handle_inbound_call_answers_starts_transcription_and_greets(monke
     assert captured == []
 
 
-def test_signature_required_without_public_key_is_invalid(monkeypatch):
-    voice = make_adapter(monkeypatch)
-    voice._require_signature = True
-    voice._public_key = ""
+def test_missing_public_key_rejects_unsigned_webhook(monkeypatch):
+    """Fail closed: no public key means nothing can be verified, so reject."""
+    voice = make_strict_adapter(monkeypatch, public_key="")
     assert voice._validate_telnyx_signature(b"{}", {}) is False
+
+
+def test_missing_public_key_rejects_even_a_correctly_signed_webhook(monkeypatch):
+    pytest.importorskip("nacl")
+    from nacl.signing import SigningKey
+
+    signing_key = SigningKey.generate()
+    body = b'{"data":{"event_type":"call.dtmf.received"}}'
+    voice = make_strict_adapter(monkeypatch, public_key="")
+    assert voice._validate_telnyx_signature(body, _signed_headers(signing_key, body)) is False
+
+
+@pytest.mark.asyncio
+async def test_webhook_without_public_key_returns_401_and_emits_nothing(monkeypatch):
+    voice = make_strict_adapter(monkeypatch, public_key="")
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    voice.handle_message = fake_handle
+    body = json.dumps(DTMF_PAYLOAD).encode()
+    request = make_mocked_request("POST", "/webhooks/telnyx/voice", headers={"Content-Type": "application/json"})
+    request._read_bytes = body
+
+    response = await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0.05)
+
+    assert response.status == 401
+    assert handled == []
+
+
+def test_missing_public_key_with_opt_out_accepts_unsigned_webhook(monkeypatch, caplog):
+    """Explicit local-development opt-out works and logs a warning."""
+    voice = make_strict_adapter(monkeypatch, public_key="")
+    monkeypatch.setenv("TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION", "true")
+    voice = adapter.TelnyxVoiceCallAdapter(PlatformConfig(enabled=True, extra={}))
+    with caplog.at_level("WARNING"):
+        assert voice._validate_telnyx_signature(b"{}", {}) is True
+    assert any("insecure" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_connect_refuses_to_start_without_public_key(monkeypatch):
+    import asyncio
+
+    voice = make_strict_adapter(monkeypatch, public_key="")
+    assert asyncio.run(voice.connect()) is False
+    assert voice._fatal_error_code == "telnyx_voice_missing_public_key"
+
+
+def test_signature_valid_is_accepted(monkeypatch):
+    pytest.importorskip("nacl")
+    from nacl.signing import SigningKey
+
+    signing_key = SigningKey.generate()
+    body = b'{"data":{"event_type":"call.dtmf.received"}}'
+    voice = make_strict_adapter(monkeypatch, public_key=_public_key_b64(signing_key))
+    assert voice._validate_telnyx_signature(body, _signed_headers(signing_key, body)) is True
+
+
+def test_signature_bad_signature_is_rejected(monkeypatch):
+    """Signed by a key that is not the configured public key."""
+    pytest.importorskip("nacl")
+    from nacl.signing import SigningKey
+
+    attacker_key = SigningKey.generate()
+    trusted_key = SigningKey.generate()
+    body = b'{"data":{"event_type":"call.dtmf.received"}}'
+    voice = make_strict_adapter(monkeypatch, public_key=_public_key_b64(trusted_key))
+    assert voice._validate_telnyx_signature(body, _signed_headers(attacker_key, body)) is False
+
+
+def test_signature_tampered_body_is_rejected(monkeypatch):
+    pytest.importorskip("nacl")
+    from nacl.signing import SigningKey
+
+    signing_key = SigningKey.generate()
+    body = b'{"data":{"event_type":"call.dtmf.received"}}'
+    headers = _signed_headers(signing_key, body)
+    voice = make_strict_adapter(monkeypatch, public_key=_public_key_b64(signing_key))
+    assert voice._validate_telnyx_signature(b'{"data":{"event_type":"call.hangup"}}', headers) is False
+
+
+@pytest.mark.asyncio
+async def test_webhook_bad_signature_returns_401(monkeypatch):
+    pytest.importorskip("nacl")
+    from nacl.signing import SigningKey
+
+    trusted_key = SigningKey.generate()
+    attacker_key = SigningKey.generate()
+    voice = make_strict_adapter(monkeypatch, public_key=_public_key_b64(trusted_key))
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    voice.handle_message = fake_handle
+    body = json.dumps(DTMF_PAYLOAD).encode()
+    request = make_mocked_request(
+        "POST",
+        "/webhooks/telnyx/voice",
+        headers={"Content-Type": "application/json", **_signed_headers(attacker_key, body)},
+    )
+    request._read_bytes = body
+
+    response = await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0.05)
+
+    assert response.status == 401
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_webhook_valid_signature_is_accepted_and_processed(monkeypatch):
+    pytest.importorskip("nacl")
+    from nacl.signing import SigningKey
+
+    signing_key = SigningKey.generate()
+    voice = make_strict_adapter(monkeypatch, public_key=_public_key_b64(signing_key))
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    voice.handle_message = fake_handle
+    body = json.dumps(DTMF_PAYLOAD).encode()
+    request = make_mocked_request(
+        "POST",
+        "/webhooks/telnyx/voice",
+        headers={"Content-Type": "application/json", **_signed_headers(signing_key, body)},
+    )
+    request._read_bytes = body
+
+    response = await voice._handle_webhook(request)
+    await __import__("asyncio").sleep(0.05)
+
+    assert response.status == 200
+    assert len(handled) == 1
+    assert handled[0].text == "Caller pressed 5."
+
+
+def test_public_key_set_ignores_insecure_opt_out(monkeypatch):
+    """The opt-out never disables verification when a key is configured."""
+    pytest.importorskip("nacl")
+    from nacl.signing import SigningKey
+
+    trusted_key = SigningKey.generate()
+    attacker_key = SigningKey.generate()
+    body = b'{"data":{"event_type":"call.dtmf.received"}}'
+    monkeypatch.setenv("TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION", "true")
+    voice = adapter.TelnyxVoiceCallAdapter(PlatformConfig(enabled=True, extra={}))
+    voice._public_key = _public_key_b64(trusted_key)
+    assert voice._validate_telnyx_signature(body, {}) is False
+    assert voice._validate_telnyx_signature(body, _signed_headers(attacker_key, body)) is False
 
 
 def test_signature_rejects_wrong_key(monkeypatch):
@@ -322,7 +521,6 @@ def test_signature_rejects_wrong_key(monkeypatch):
 
     voice = make_adapter(monkeypatch)
     voice._public_key = public_key_b64
-    voice._require_signature = True
 
     result = voice._validate_telnyx_signature(body, {
         "Telnyx-Signature-Ed25519": signature_b64,
@@ -368,7 +566,6 @@ def test_signature_verification_with_base64_keypair(monkeypatch):
 
     voice = make_adapter(monkeypatch)
     voice._public_key = public_key_b64
-    voice._require_signature = True
 
     assert voice._validate_telnyx_signature(body, {
         "Telnyx-Signature-Ed25519": signature_b64,
@@ -1266,3 +1463,80 @@ async def test_call_hangup_stops_transcription(monkeypatch):
     tr_stop_posts = [p for p in fake.posts if "/actions/transcription_stop" in p["url"]]
     assert len(tr_stop_posts) == 1
     assert "cc-hang-tr" not in voice._active_transcriptions
+
+
+@pytest.mark.asyncio
+async def test_dtmf_media_stream_frame_emits_caller_message(monkeypatch):
+    """A keypress over the media stream is delivered to the agent without raising.
+
+    Regression: the dtmf branch called _emit_call_event, which does not exist,
+    so every keypress raised AttributeError inside the WebSocket handler.
+    """
+    import asyncio
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    voice = make_adapter(monkeypatch)
+    voice._active_calls["cc-dtmf-stream"] = adapter.CallSession(
+        call_control_id="cc-dtmf-stream",
+        caller_number="+155****0002",
+    )
+    captured = []
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    voice.handle_message = fake_handle
+
+    app = web.Application()
+    app.router.add_get("/ws/telnyx/voice/stream", voice._handle_websocket)
+    async with TestClient(TestServer(app)) as client:
+        ws = await client.ws_connect("/ws/telnyx/voice/stream")
+        await ws.send_str(json.dumps({
+            "event": "start",
+            "stream_id": "stream-dtmf",
+            "start": {"call_control_id": "cc-dtmf-stream"},
+        }))
+        await ws.send_str(json.dumps({
+            "event": "dtmf",
+            "stream_id": "stream-dtmf",
+            "dtmf": {"digit": "5"},
+        }))
+        await ws.close()
+
+    await asyncio.sleep(0.05)
+    assert len(captured) == 1
+    assert captured[0].text == "Caller pressed 5 (via media stream)"
+    assert captured[0].source.chat_id == adapter._call_control_chat_id("cc-dtmf-stream")
+
+
+@pytest.mark.asyncio
+async def test_dtmf_media_stream_frame_for_unknown_call_is_ignored(monkeypatch):
+    import asyncio
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    voice = make_adapter(monkeypatch)
+    captured = []
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    voice.handle_message = fake_handle
+
+    app = web.Application()
+    app.router.add_get("/ws/telnyx/voice/stream", voice._handle_websocket)
+    async with TestClient(TestServer(app)) as client:
+        ws = await client.ws_connect("/ws/telnyx/voice/stream")
+        await ws.send_str(json.dumps({
+            "event": "start",
+            "stream_id": "stream-unknown",
+            "start": {"call_control_id": "cc-not-tracked"},
+        }))
+        await ws.send_str(json.dumps({"event": "dtmf", "dtmf": {"digit": "9"}}))
+        await ws.close()
+
+    await asyncio.sleep(0.05)
+    assert captured == []
