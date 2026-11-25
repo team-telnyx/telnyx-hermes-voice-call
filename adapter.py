@@ -1006,13 +1006,14 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
                         )
 
                     elif event == "dtmf":
-                        digit = str(frame.get("dtmf", {}).get("digit", ""))
+                        digit = str((frame.get("dtmf") or {}).get("digit") or "").strip()
                         logger.info("[telnyx_voice_call] ws: DTMF digit=%s stream=%s", digit, stream_id)
-                        # Emit as a Hermes message event if call_control_id is known
-                        if call_control_id:
+                        # Deliver as a caller message, the same way webhook call events are
+                        # delivered, once the call is known.
+                        if call_control_id and digit:
                             session = self._active_calls.get(call_control_id)
                             if session:
-                                await self._emit_call_event(
+                                await self._emit_caller_message(
                                     {"data": {"event_type": "call.dtmf.received", "payload": {"call_control_id": call_control_id}}},
                                     session,
                                     call_control_id,

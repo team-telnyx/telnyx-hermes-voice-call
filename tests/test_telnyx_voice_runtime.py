@@ -1463,3 +1463,80 @@ async def test_call_hangup_stops_transcription(monkeypatch):
     tr_stop_posts = [p for p in fake.posts if "/actions/transcription_stop" in p["url"]]
     assert len(tr_stop_posts) == 1
     assert "cc-hang-tr" not in voice._active_transcriptions
+
+
+@pytest.mark.asyncio
+async def test_dtmf_media_stream_frame_emits_caller_message(monkeypatch):
+    """A keypress over the media stream is delivered to the agent without raising.
+
+    Regression: the dtmf branch called _emit_call_event, which does not exist,
+    so every keypress raised AttributeError inside the WebSocket handler.
+    """
+    import asyncio
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    voice = make_adapter(monkeypatch)
+    voice._active_calls["cc-dtmf-stream"] = adapter.CallSession(
+        call_control_id="cc-dtmf-stream",
+        caller_number="+155****0002",
+    )
+    captured = []
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    voice.handle_message = fake_handle
+
+    app = web.Application()
+    app.router.add_get("/ws/telnyx/voice/stream", voice._handle_websocket)
+    async with TestClient(TestServer(app)) as client:
+        ws = await client.ws_connect("/ws/telnyx/voice/stream")
+        await ws.send_str(json.dumps({
+            "event": "start",
+            "stream_id": "stream-dtmf",
+            "start": {"call_control_id": "cc-dtmf-stream"},
+        }))
+        await ws.send_str(json.dumps({
+            "event": "dtmf",
+            "stream_id": "stream-dtmf",
+            "dtmf": {"digit": "5"},
+        }))
+        await ws.close()
+
+    await asyncio.sleep(0.05)
+    assert len(captured) == 1
+    assert captured[0].text == "Caller pressed 5 (via media stream)"
+    assert captured[0].source.chat_id == adapter._call_control_chat_id("cc-dtmf-stream")
+
+
+@pytest.mark.asyncio
+async def test_dtmf_media_stream_frame_for_unknown_call_is_ignored(monkeypatch):
+    import asyncio
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    voice = make_adapter(monkeypatch)
+    captured = []
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    voice.handle_message = fake_handle
+
+    app = web.Application()
+    app.router.add_get("/ws/telnyx/voice/stream", voice._handle_websocket)
+    async with TestClient(TestServer(app)) as client:
+        ws = await client.ws_connect("/ws/telnyx/voice/stream")
+        await ws.send_str(json.dumps({
+            "event": "start",
+            "stream_id": "stream-unknown",
+            "start": {"call_control_id": "cc-not-tracked"},
+        }))
+        await ws.send_str(json.dumps({"event": "dtmf", "dtmf": {"digit": "9"}}))
+        await ws.close()
+
+    await asyncio.sleep(0.05)
+    assert captured == []
