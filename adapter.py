@@ -263,7 +263,7 @@ class TelnyxVoiceCallAdapter(BasePlatformAdapter):
         self._runner = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         import aiohttp
         from aiohttp import web
 
