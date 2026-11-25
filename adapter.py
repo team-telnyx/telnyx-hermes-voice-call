@@ -27,7 +27,10 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import redact_phone, strip_markdown
 from gateway.session import SessionSource
 
-from provisioning import ProvisioningResult, deprovision, provision
+try:
+    from .provisioning import ProvisioningResult, deprovision, provision
+except ImportError:  # loaded as a flat module (repo tests, direct file load)
+    from provisioning import ProvisioningResult, deprovision, provision
 
 logger = logging.getLogger(__name__)
 
