@@ -298,7 +298,7 @@ to call `streaming_start` with the correct URL.
 | `TELNYX_VOICE_WEBHOOK_PORT` | `8088` | Webhook listen port |
 | `TELNYX_VOICE_WEBHOOK_PATH` | `/webhooks/telnyx/voice` | Webhook path |
 | `TELNYX_PUBLIC_KEY` | unset | Telnyx account public key for webhook signature verification. Find it at [Mission Control → Public Key](https://portal.telnyx.com/#/app/account/public-key). |
-| `TELNYX_VOICE_REQUIRE_SIGNATURE` | `false` | Require valid Telnyx webhook signatures |
+| `TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION` | `false` | Local development only. Accept webhooks without a public key, with no verification. Ignored when `TELNYX_PUBLIC_KEY` is set. Logs a warning. |
 | `TELNYX_VOICE_SIGNATURE_TOLERANCE` | `300` | Signature timestamp tolerance in seconds; `0` disables freshness check |
 | `TELNYX_VOICE_ALLOWED_USERS` | unset | Comma-separated E.164 numbers allowed to call the bot |
 | `TELNYX_VOICE_ALLOW_ALL_USERS` | `false` | Allow any caller phone number to talk to the bot; development only |
@@ -355,11 +355,13 @@ the call creation still succeeds and answered webhooks can continue the session.
 
 ## Webhook security
 
-Production deployments should configure `TELNYX_PUBLIC_KEY` and set:
+Webhook signatures are always verified. Set `TELNYX_PUBLIC_KEY`. Without it the
+adapter refuses to start and rejects every webhook with `401`, so an unsigned
+request can never start a call or reach the agent. The only way to run without
+a key is `TELNYX_VOICE_INSECURE_SKIP_SIGNATURE_VERIFICATION=true`, which is for
+local development. The adapter logs a warning while it is set.
 
-```bash
-TELNYX_VOICE_REQUIRE_SIGNATURE=true
-```
+`TELNYX_VOICE_REQUIRE_SIGNATURE` is no longer read. Remove it from your config.
 
 The adapter verifies Telnyx's Ed25519 signature over `timestamp|payload`, checks
 clock skew, and rejects replayed signed payloads. Raw Base64/Base64URL Ed25519
